@@ -8,7 +8,6 @@ import akshare as ak
 app = Flask(__name__)
 
 def code_to_eastmoney_secid(code):
-    """将 sh/sz 代码转换为东方财富 secid，例如 sh600036 -> 1.600036"""
     if code.startswith('sh'):
         digits = code[2:]
         market = '1'
@@ -20,7 +19,7 @@ def code_to_eastmoney_secid(code):
         market = '1' if digits.startswith('6') else '0'
     return f"{market}.{digits}"
 
-# ---------- 东方财富实时行情（盘口） ----------
+# ---------- 盘口 ----------
 @app.route('/api/quote')
 def quote():
     code = request.args.get('code', 'sh600036')
@@ -52,7 +51,7 @@ def quote():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# ---------- 盘中实时分时（东方财富 1分钟K线，当日） ----------
+# ---------- 盘中分时 ----------
 @app.route('/api/minute_data')
 def minute_data():
     code = request.args.get('code', 'sh600036')
@@ -64,7 +63,7 @@ def minute_data():
             'secid': secid,
             'fields1': 'f1,f2,f3,f4,f5,f6',
             'fields2': 'f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61',
-            'klt': '1',       # 1分钟
+            'klt': '1',
             'fqt': '0',
             'end': today,
             'lmt': '240'
@@ -78,9 +77,9 @@ def minute_data():
             for line in lines:
                 parts = line.split(',')
                 if len(parts) >= 6:
-                    time_str = parts[0][-8:]  # 例如 "09:30:00"
+                    time_str = parts[0][-8:]
                     data.append({
-                        "time": time_str[:5],  # "09:30"
+                        "time": time_str[:5],
                         "price": float(parts[2]),
                         "volume": int(parts[5])
                     })
@@ -91,7 +90,7 @@ def minute_data():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# ---------- 历史分时（同东方财富，可指定日期） ----------
+# ---------- 历史分时 ----------
 @app.route('/api/hist_minute_data')
 def hist_minute_data():
     code = request.args.get('code', 'sh600036')
@@ -130,19 +129,24 @@ def hist_minute_data():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# ---------- 分时成交明细（AKShare tick 数据） ----------
+# ---------- 分时成交明细 ----------
 @app.route('/api/tick_data')
 def tick_data():
     code = request.args.get('code', 'sh688981')
+    symbol = code.replace('.', '').replace('SZ', 'sz').replace('SH', 'sh')
     try:
-        df = ak.stock_zh_a_tick_tx_js(symbol=code)
+        df = ak.stock_zh_a_tick_tx_js(symbol=symbol)
+        if df is None or df.empty:
+            return jsonify({"error": "AKShare returned empty DataFrame", "symbol": symbol})
         data = []
         for _, row in df.iterrows():
             time_val = str(row.get('成交时间', row.get('时间', '')))
             price = row.get('成交价格', row.get('价格', 0))
             volume = row.get('成交量', 0)
             nature = row.get('性质', '')
-            direction = 'B' if '买' in str(nature) else 'S'
+            direction = 'S'
+            if '买' in str(nature):
+                direction = 'B'
             data.append({
                 '时间': time_val,
                 '价格': price,
@@ -150,9 +154,11 @@ def tick_data():
             })
         return jsonify(data)
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
-# ---------- 前端页面（整合所有功能） ----------
+# ---------- 全新同屏布局模板 ----------
 HTML_TEMPLATE = r"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -162,20 +168,19 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <script type="text/javascript" src="https://s3.tradingview.com/tv.js"></script>
     <style>
         body { font-family: Arial, sans-serif; margin: 20px; }
-        #search-box { margin-bottom: 10px; }
+        #search-box { margin-bottom: 15px; }
         #codeInput { padding: 10px; font-size: 16px; width: 150px; }
         button { padding: 10px 15px; cursor: pointer; }
-        .tab { overflow: hidden; border-bottom: 1px solid #ccc; margin-bottom: 10px; }
-        .tab button { background-color: #f1f1f1; float: left; border: none; outline: none; cursor: pointer; padding: 10px 20px; }
-        .tab button.active { background-color: #ddd; }
-        .tabcontent { display: none; padding: 6px 12px; border-top: none; }
+        h2 { margin: 10px 0; }
         #quote-panel { margin: 10px 0; padding: 10px; border: 1px solid #eee; background: #fafafa; }
-        #chart-container { width: 100%; height: 400px; }
+        #minute-chart-container { width: 100%; height: 400px; margin-bottom: 20px; }
         .sub-tab { margin: 5px 0; }
         .sub-tab button { padding: 6px 12px; font-size: 14px; }
-        #tick-table-container { height: 400px; overflow-y: auto; border: 1px solid #ccc; margin-top: 20px; }
+        #tick-table-container { height: 350px; overflow-y: auto; border: 1px solid #ccc; margin: 20px 0; }
         #tick-table { width: 100%; border-collapse: collapse; font-family: monospace; }
-        #tick-table th { position: sticky; top: 0; background: #f2f2f2; }
+        #tick-table th { position: sticky; top: 0; background: #f2f2f2; z-index: 1; }
+        #kline-chart-container { width: 100%; height: 600px; margin-top: 30px; border-top: 2px solid #ccc; padding-top: 20px; }
+        .section-title { font-size: 18px; font-weight: bold; margin: 10px 0 5px; }
     </style>
 </head>
 <body>
@@ -185,59 +190,56 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     </div>
     <h2 id="stockTitle">加载中...</h2>
 
-    <div class="tab">
-        <button class="tablinks active" onclick="openTab(event, 'timeline')">分时图</button>
-        <button class="tablinks" onclick="openTab(event, 'kline')">K线图 (TradingView)</button>
+    <!-- 盘口数据 -->
+    <div id="quote-panel">
+        <span>最新价: <b id="q_price">--</b></span>
+        <span>涨幅: <b id="q_pct">--</b></span>
+        <span>成交量: <b id="q_vol">--</b></span>
     </div>
 
-    <div id="timeline" class="tabcontent" style="display: block;">
-        <div id="quote-panel">
-            <span>最新价: <b id="q_price">--</b></span>
-            <span>涨幅: <b id="q_pct">--</b></span>
-            <span>成交量: <b id="q_vol">--</b></span>
-        </div>
-        <div class="sub-tab">
-            <button id="btn_realtime" onclick="switchToRealtime()" style="font-weight:bold;">盘中实时</button>
-            <button id="btn_history" onclick="switchToHistory()">盘后复盘</button>
-            <input type="date" id="dateInput" style="margin-left:10px;">
-        </div>
-        <div id="chart-container"></div>
-        <div id="data_source" style="font-size:12px; color:#888;"></div>
+    <!-- 分时图区域（含子标签） -->
+    <div class="section-title">📈 分时走势</div>
+    <div class="sub-tab">
+        <button id="btn_realtime" onclick="switchToRealtime()" style="font-weight:bold;">盘中实时</button>
+        <button id="btn_history" onclick="switchToHistory()">盘后复盘</button>
+        <input type="date" id="dateInput" style="margin-left:10px;">
+    </div>
+    <div id="minute-chart-container"></div>
+    <div id="data_source" style="font-size:12px; color:#888;"></div>
 
-        <!-- 分时成交明细表格 -->
-        <div id="tick-table-container">
-            <table id="tick-table">
-                <thead>
-                    <tr>
-                        <th style="padding: 8px; border-bottom: 1px solid #ddd;">时间</th>
-                        <th style="padding: 8px; border-bottom: 1px solid #ddd;">价格</th>
-                        <th style="padding: 8px; border-bottom: 1px solid #ddd;">成交</th>
-                    </tr>
-                </thead>
-                <tbody id="tick-table-body">
-                </tbody>
-            </table>
-        </div>
+    <!-- 分时成交明细 -->
+    <div class="section-title">📋 分时成交明细</div>
+    <div id="tick-table-container">
+        <table id="tick-table">
+            <thead>
+                <tr>
+                    <th style="padding: 8px; border-bottom: 1px solid #ddd;">时间</th>
+                    <th style="padding: 8px; border-bottom: 1px solid #ddd;">价格</th>
+                    <th style="padding: 8px; border-bottom: 1px solid #ddd;">成交</th>
+                </tr>
+            </thead>
+            <tbody id="tick-table-body"></tbody>
+        </table>
     </div>
 
-    <div id="kline" class="tabcontent">
-        <div class="tradingview-widget-container">
-            <div id="tradingview_kline"></div>
-        </div>
+    <!-- K线图（TradingView） -->
+    <div class="section-title">📊 K线图 (日K)</div>
+    <div id="kline-chart-container">
+        <div id="tradingview_kline"></div>
     </div>
 
     <script>
         let currentCode = window.location.pathname.split('/stock/')[1] || 'sh600036';
-        let chart = null;
+        let minuteChart = echarts.init(document.getElementById('minute-chart-container'));
         let tvWidget = null;
         let activeSubTab = 'realtime';
 
         window.onload = function() {
             document.getElementById('codeInput').value = currentCode;
-            openTab(null, 'timeline');
             loadQuote();
             loadMinuteData();
             loadTickData(currentCode);
+            initKlineWidget();
         };
 
         function switchStock() {
@@ -251,6 +253,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             if (activeSubTab === 'realtime') loadMinuteData();
             else loadHistData();
             loadTickData(currentCode);
+            updateTradingViewSymbol();
         }
 
         function loadQuote() {
@@ -273,14 +276,15 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 .then(r => r.json())
                 .then(res => {
                     if (res.success) {
-                        drawChart(res.data);
+                        drawMinuteChart(res.data);
                         document.getElementById('data_source').innerText = '数据来源：东方财富（当日分时）';
                     } else {
-                        document.getElementById('chart-container').innerHTML = '<p>暂无盘中分时数据，可切换至“盘后复盘”</p>';
-                        document.getElementById('data_source').innerText = '';
+                        minuteChart.clear();
+                        document.getElementById('data_source').innerText = '暂无盘中分时数据，可切换至“盘后复盘”';
                     }
                 }).catch(e => {
-                    document.getElementById('chart-container').innerHTML = '<p>获取数据失败</p>';
+                    minuteChart.clear();
+                    document.getElementById('data_source').innerText = '获取数据失败';
                 });
         }
 
@@ -293,23 +297,23 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 .then(r => r.json())
                 .then(res => {
                     if (res.success) {
-                        drawChart(res.data);
+                        drawMinuteChart(res.data);
                         document.getElementById('data_source').innerText = '数据来源：东方财富（历史回放） - 交易日期：' + res.trade_date;
                     } else {
-                        document.getElementById('chart-container').innerHTML = '<p>未获取到历史分时数据</p>';
-                        document.getElementById('data_source').innerText = '';
+                        minuteChart.clear();
+                        document.getElementById('data_source').innerText = '未获取到历史分时数据';
                     }
                 }).catch(e => {
-                    document.getElementById('chart-container').innerHTML = '<p>获取数据失败</p>';
+                    minuteChart.clear();
+                    document.getElementById('data_source').innerText = '获取数据失败';
                 });
         }
 
-        function drawChart(data) {
+        function drawMinuteChart(data) {
             const times = data.map(d => d.time);
             const prices = data.map(d => d.price);
             const volumes = data.map(d => d.volume);
-            if (!chart) chart = echarts.init(document.getElementById('chart-container'));
-            chart.setOption({
+            minuteChart.setOption({
                 tooltip: { trigger: 'axis' },
                 grid: [
                     { left: '8%', right: '8%', top: '10%', height: '50%' },
@@ -330,7 +334,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             });
         }
 
-        // 加载分时成交明细
         function loadTickData(code) {
             fetch('/api/tick_data?code=' + code)
                 .then(r => r.json())
@@ -348,8 +351,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                     });
                     const container = document.getElementById('tick-table-container');
                     container.scrollTop = container.scrollHeight;
-                })
-                .catch(e => console.error(e));
+                }).catch(e => console.error(e));
         }
 
         function switchToRealtime() {
@@ -366,33 +368,31 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             loadHistData();
         }
 
-        function openTab(evt, tabName) {
-            const tabs = document.getElementsByClassName('tabcontent');
-            for (let t of tabs) t.style.display = 'none';
-            const links = document.getElementsByClassName('tablinks');
-            for (let l of links) l.classList.remove('active');
-            document.getElementById(tabName).style.display = 'block';
-            if (evt) evt.currentTarget.classList.add('active');
-            else document.querySelector('.tablinks').classList.add('active');
-            if (tabName === 'kline' && !tvWidget) {
+        function initKlineWidget() {
+            let symbol = currentCode.replace('sh','SSE:').replace('sz','SZSE:');
+            tvWidget = new TradingView.widget({
+                "container_id": "tradingview_kline",
+                "autosize": true,
+                "symbol": symbol,
+                "interval": "D",
+                "timezone": "Asia/Shanghai",
+                "theme": "light",
+                "style": "1",
+                "locale": "zh_CN",
+                "toolbar_bg": "#f1f3f6",
+                "enable_publishing": false,
+                "hide_side_toolbar": false,
+                "allow_symbol_change": false,
+                "details": true,
+                "width": "100%",
+                "height": 600
+            });
+        }
+
+        function updateTradingViewSymbol() {
+            if (tvWidget) {
                 let symbol = currentCode.replace('sh','SSE:').replace('sz','SZSE:');
-                tvWidget = new TradingView.widget({
-                    "container_id": "tradingview_kline",
-                    "autosize": true,
-                    "symbol": symbol,
-                    "interval": "D",
-                    "timezone": "Asia/Shanghai",
-                    "theme": "light",
-                    "style": "1",
-                    "locale": "zh_CN",
-                    "toolbar_bg": "#f1f3f6",
-                    "enable_publishing": false,
-                    "hide_side_toolbar": false,
-                    "allow_symbol_change": false,
-                    "details": true,
-                    "width": "100%",
-                    "height": 600
-                });
+                tvWidget.setSymbol(symbol, "D", () => {});
             }
         }
     </script>
