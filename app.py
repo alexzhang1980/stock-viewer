@@ -2,11 +2,12 @@ import os
 import requests
 from flask import Flask, jsonify, render_template_string, request
 from mootdx.quotes import Quotes
+import akshare as ak
 import pandas as pd
 from datetime import datetime
 
 app = Flask(__name__)
-# 初始化通达信行情接口（标准市场）
+# 初始化通达信行情接口（用于盘中实时分时数据）
 tdx_client = Quotes.factory(market='std')
 
 def code_to_market(code):
@@ -19,46 +20,18 @@ def code_to_market(code):
         # 默认深市
         return 0, code
 
-# 新浪接口保留，用于获取股票名称和简单实时行情（作为盘口显示的后备）
-def fetch_stock_from_sina(code):
-    url = f"https://hq.sinajs.cn/list={code}"
-    headers = {"Referer": "https://finance.sina.com.cn"}
-    resp = requests.get(url, headers=headers, timeout=5)
-    resp.encoding = "gbk"
-    raw = resp.text
-    data_str = raw.split('"')[1]
-    if not data_str:
-        return None
-    fields = data_str.split(",")
-    return {
-        "name": fields[0],
-        "price": float(fields[3]),
-        "change": round(float(fields[3]) - float(fields[2]), 2),
-        "pct": round((float(fields[3]) - float(fields[2])) / float(fields[2]) * 100, 2),
-        "high": fields[4],
-        "low": fields[5],
-        "open": fields[1],
-        "pre_close": fields[2],
-    }
-
-# ---------- 新增 API：当日分钟级分时数据（mootdx） ----------
+# ---------- 盘中实时分时（MOOTDX） ----------
 @app.route('/api/minute_data')
 def minute_data():
-    code = request.args.get('code', 'sh000001')
+    code = request.args.get('code', 'sh600036')
     market, raw_code = code_to_market(code)
     try:
-        # 获取当日分钟K线数据，type=0 为5分钟线，这里用1分钟线（通达信 type=3 是1分钟？）
-        # 实际上通达信标准接口：get_minute_time 可能返回当日所有分钟数据
-        # 这里使用 get_minute_time(symbol, market) 直接返回分时数据
+        # 盘中实时分钟数据
         df = tdx_client.minute(symbol=raw_code, market=market)
         if df is None or df.empty:
-            return jsonify({"error": "未获取到分时数据，可能非交易时间"}), 404
-
-        # 数据格式：时间 'time'，价格 'price'，成交量 'volume'
-        # 转换为前端需要的格式
+            return jsonify({"error": "盘中暂无分时数据，可能非交易时间"}), 404
         data = []
         for _, row in df.iterrows():
-            # 时间格式通常为 '0930' 这样的字符串，需要补全为 '09:30'
             t = str(row.get('time', row.get('分钟', '')))
             if len(t) == 4:
                 t = t[:2] + ':' + t[2:]
@@ -67,17 +40,41 @@ def minute_data():
                 "price": float(row['price']),
                 "volume": int(row['volume'])
             })
-        return jsonify({"success": True, "data": data})
+        return jsonify({"success": True, "data": data, "source": "MOOTDX (盘中实时)"})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# ---------- 新增 API：五档盘口（mootdx 实时行情） ----------
+# ---------- 盘后历史分时（AKShare） ----------
+@app.route('/api/hist_minute_data')
+def hist_minute_data():
+    code = request.args.get('code', 'sh600036')
+    # 日期参数前端可传，但AKShare这个接口只返回最近一个交易日的数据，这里保留以便将来扩展
+    date_str = request.args.get('date', datetime.now().strftime('%Y%m%d'))
+    try:
+        # period='1' 表示1分钟线
+        df = ak.stock_zh_a_minute(symbol=code, period='1', adjust='')
+        if df is None or df.empty:
+            return jsonify({"error": "未获取到历史分时数据"}), 404
+        data = []
+        for _, row in df.iterrows():
+            # 时间列可能为 '09:30:00' 格式，取前5位
+            t = str(row['时间'])[:5]
+            data.append({
+                "time": t,
+                "price": float(row['收盘']),
+                "volume": int(row['成交量'])
+            })
+        trade_date = str(df.iloc[0]['时间'])[:10]
+        return jsonify({"success": True, "data": data, "trade_date": trade_date, "source": "AKShare (历史复盘)"})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# ---------- 五档盘口（MOOTDX） ----------
 @app.route('/api/quote')
 def quote():
-    code = request.args.get('code', 'sh000001')
+    code = request.args.get('code', 'sh600036')
     market, raw_code = code_to_market(code)
     try:
-        # 获取实时盘口
         res = tdx_client.quotes(symbol=raw_code, market=market)
         if res is None or res.empty:
             return jsonify({"error": "获取盘口失败"}), 404
@@ -95,12 +92,11 @@ def quote():
             "sell1": float(row['sell1']),
             "bp1": int(row['bp1']),
             "sp1": int(row['sp1']),
-            # 可扩展更多档位
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# ---------- 全新前端模板（融合 TradingView K线 + ECharts 分时盘口） ----------
+# ---------- 前端页面（整合实时 + 历史复盘 + K线） ----------
 HTML_TEMPLATE = r"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -119,6 +115,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         .tabcontent { display: none; padding: 6px 12px; border-top: none; }
         #quote-panel { margin: 10px 0; padding: 10px; border: 1px solid #eee; background: #fafafa; }
         #chart-container { width: 100%; height: 400px; }
+        .sub-tab { margin: 5px 0; }
+        .sub-tab button { padding: 6px 12px; font-size: 14px; }
     </style>
 </head>
 <body>
@@ -129,11 +127,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <h2 id="stockTitle">加载中...</h2>
 
     <div class="tab">
-        <button class="tablinks active" onclick="openTab(event, 'timeline')">分时图（自主）</button>
+        <button class="tablinks active" onclick="openTab(event, 'timeline')">分时图</button>
         <button class="tablinks" onclick="openTab(event, 'kline')">K线图 (TradingView)</button>
     </div>
 
-    <!-- 自主分时图标签页 -->
+    <!-- 分时图标签页 -->
     <div id="timeline" class="tabcontent" style="display: block;">
         <div id="quote-panel">
             <span>最新价: <b id="q_price">--</b></span>
@@ -142,10 +140,19 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             <span>买一: <b id="q_buy1">--</b></span>
             <span>卖一: <b id="q_sell1">--</b></span>
         </div>
+
+        <!-- 子标签：切换实时 / 历史 -->
+        <div class="sub-tab">
+            <button id="btn_realtime" onclick="switchToRealtime()" style="font-weight:bold;">盘中实时</button>
+            <button id="btn_history" onclick="switchToHistory()">盘后复盘</button>
+            <input type="date" id="dateInput" style="margin-left:10px;">
+        </div>
+
         <div id="chart-container"></div>
+        <div id="data_source" style="font-size:12px; color:#888;"></div>
     </div>
 
-    <!-- TradingView K线图标签页 -->
+    <!-- K线图标签页 -->
     <div id="kline" class="tabcontent">
         <div class="tradingview-widget-container">
             <div id="tradingview_kline"></div>
@@ -156,11 +163,13 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         let currentCode = window.location.pathname.split('/stock/')[1] || 'sh600036';
         let chart = null;
         let tvWidget = null;
+        let activeSubTab = 'realtime'; // 'realtime' 或 'history'
 
         window.onload = function() {
             document.getElementById('codeInput').value = currentCode;
             openTab(null, 'timeline');
-            loadAllData();
+            loadQuote();
+            loadMinuteData(); // 默认加载实时数据
         };
 
         function switchStock() {
@@ -169,12 +178,14 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             if (/^\d{6}$/.test(input)) input = (input.startsWith('6') ? 'sh' : 'sz') + input;
             currentCode = input.toLowerCase();
             window.history.pushState(null, null, '/stock/' + currentCode);
-            loadAllData();
+            document.getElementById('stockTitle').innerText = currentCode;
+            loadQuote();
+            if (activeSubTab === 'realtime') loadMinuteData();
+            else loadHistData();
         }
 
-        async function loadAllData() {
-            document.getElementById('stockTitle').innerText = currentCode;
-            // 加载盘口
+        // 加载盘口数据
+        function loadQuote() {
             fetch('/api/quote?code=' + currentCode)
                 .then(r => r.json())
                 .then(d => {
@@ -187,21 +198,53 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                         document.getElementById('q_buy1').innerText = d.buy1 + '(' + d.bp1 + ')';
                         document.getElementById('q_sell1').innerText = d.sell1 + '(' + d.sp1 + ')';
                     }
-                });
-            // 加载分时图
+                })
+                .catch(() => {});
+        }
+
+        // 盘中实时数据
+        function loadMinuteData() {
+            document.getElementById('data_source').innerText = '加载中...';
             fetch('/api/minute_data?code=' + currentCode)
                 .then(r => r.json())
                 .then(res => {
                     if (res.success) {
-                        drawMinuteChart(res.data);
+                        drawChart(res.data);
+                        document.getElementById('data_source').innerText = '数据来源：MOOTDX（盘中实时）';
                     } else {
-                        document.getElementById('chart-container').innerHTML = '<p>暂无分时数据（可能非交易时间）</p>';
+                        document.getElementById('chart-container').innerHTML = '<p>暂无盘中分时数据（可能非交易时间），可切换至“盘后复盘”查看历史数据</p>';
+                        document.getElementById('data_source').innerText = '';
                     }
+                })
+                .catch(e => {
+                    document.getElementById('chart-container').innerHTML = '<p>获取数据失败</p>';
                 });
-            // 加载/更新 TradingView K线图（只在切换到K线标签时初始化）
         }
 
-        function drawMinuteChart(data) {
+        // 盘后历史数据
+        function loadHistData() {
+            let date = document.getElementById('dateInput').value;
+            let url = '/api/hist_minute_data?code=' + currentCode;
+            if (date) url += '&date=' + date.replace(/-/g, '');
+            document.getElementById('data_source').innerText = '加载中...';
+            fetch(url)
+                .then(r => r.json())
+                .then(res => {
+                    if (res.success) {
+                        drawChart(res.data);
+                        document.getElementById('data_source').innerText = '数据来源：AKShare（历史回放） - 交易日期：' + res.trade_date;
+                    } else {
+                        document.getElementById('chart-container').innerHTML = '<p>未获取到历史分时数据</p>';
+                        document.getElementById('data_source').innerText = '';
+                    }
+                })
+                .catch(e => {
+                    document.getElementById('chart-container').innerHTML = '<p>获取数据失败</p>';
+                });
+        }
+
+        // ECharts 绘图
+        function drawChart(data) {
             const times = data.map(d => d.time);
             const prices = data.map(d => d.price);
             const volumes = data.map(d => d.volume);
@@ -230,6 +273,21 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             });
         }
 
+        function switchToRealtime() {
+            activeSubTab = 'realtime';
+            document.getElementById('btn_realtime').style.fontWeight = 'bold';
+            document.getElementById('btn_history').style.fontWeight = 'normal';
+            loadMinuteData();
+        }
+
+        function switchToHistory() {
+            activeSubTab = 'history';
+            document.getElementById('btn_realtime').style.fontWeight = 'normal';
+            document.getElementById('btn_history').style.fontWeight = 'bold';
+            loadHistData();
+        }
+
+        // 主标签切换
         function openTab(evt, tabName) {
             const tabs = document.getElementsByClassName('tabcontent');
             for (let t of tabs) t.style.display = 'none';
