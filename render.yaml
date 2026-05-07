@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: stock-viewer
+    env: python
+    buildCommand: pip install --default-timeout=600 -r requirements.txt
+    startCommand: python app.py
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.0
