@@ -5,5 +5,5 @@ flask
 requests
 numpy<2.0
 pandas<2.0
-akshare
 mootdx
+akshare
