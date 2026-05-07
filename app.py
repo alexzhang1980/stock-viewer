@@ -1,25 +1,14 @@
 import os
 import requests
 import json
-import re
 from flask import Flask, jsonify, render_template_string, request
-from mootdx.quotes import Quotes
 import pandas as pd
 from datetime import datetime
 
 app = Flask(__name__)
-tdx_client = Quotes.factory(market='std')
-
-def code_to_market(code):
-    if code.startswith('sz') or (code.isdigit() and (code.startswith('0') or code.startswith('3'))):
-        return 0, code.replace('sz','').replace('SZ','')
-    elif code.startswith('sh') or (code.isdigit() and code.startswith('6')):
-        return 1, code.replace('sh','').replace('SH','')
-    else:
-        return 0, code
 
 def code_to_eastmoney_secid(code):
-    """将 sh/sz 代码转换为东方财富的 secid，例如 sh600036 -> 1.600036"""
+    """将 sh/sz 代码转换为东方财富 secid，例如 sh600036 -> 1.600036"""
     if code.startswith('sh'):
         digits = code[2:]
         market = '1'
@@ -27,60 +16,63 @@ def code_to_eastmoney_secid(code):
         digits = code[2:]
         market = '0'
     else:
-        # 纯数字
         digits = code
-        if digits.startswith('6'):
-            market = '1'
-        else:
-            market = '0'
+        market = '1' if digits.startswith('6') else '0'
     return f"{market}.{digits}"
 
-# ---------- 盘中实时分时（MOOTDX） ----------
-@app.route('/api/minute_data')
-def minute_data():
+# ---------- 东方财富实时行情（盘口） ----------
+@app.route('/api/quote')
+def quote():
     code = request.args.get('code', 'sh600036')
-    market, raw_code = code_to_market(code)
+    secid = code_to_eastmoney_secid(code)
     try:
-        df = tdx_client.minute(symbol=raw_code, market=market)
-        if df is None or df.empty:
-            return jsonify({"error": "盘中暂无分时数据"}), 404
-        data = []
-        for _, row in df.iterrows():
-            t = str(row.get('time', row.get('分钟', '')))
-            if len(t) == 4:
-                t = t[:2] + ':' + t[2:]
-            data.append({
-                "time": t,
-                "price": float(row['price']),
-                "volume": int(row['volume'])
-            })
-        return jsonify({"success": True, "data": data, "source": "MOOTDX (盘中实时)"})
+        url = "https://push2.eastmoney.com/api/qt/stock/get"
+        params = {
+            'secid': secid,
+            'fields': 'f43,f44,f45,f46,f47,f48,f50,f57,f58,f170',
+            'invt': '2',
+            'fltt': '2'
+        }
+        headers = {'Referer': 'https://quote.eastmoney.com/'}
+        resp = requests.get(url, params=params, headers=headers, timeout=10)
+        data = resp.json().get('data', {})
+        if not data:
+            return jsonify({"error": "未获取到数据"}), 404
+        return jsonify({
+            "name": data.get('f58', ''),
+            "price": data.get('f43', 0) / 100 if data.get('f43') else 0,
+            "last_close": data.get('f60', 0) / 100 if data.get('f60') else 0,
+            "open": data.get('f46', 0) / 100 if data.get('f46') else 0,
+            "high": data.get('f44', 0) / 100 if data.get('f44') else 0,
+            "low": data.get('f45', 0) / 100 if data.get('f45') else 0,
+            "volume": data.get('f47', 0),
+            "amount": data.get('f48', 0),
+            # 东方财富免费接口一般不提供五档盘口，可留空
+            "buy1": "-", "sell1": "-", "bp1": "-", "sp1": "-"
+        })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# ---------- 盘后历史分时（东方财富 API） ----------
-@app.route('/api/hist_minute_data')
-def hist_minute_data():
+# ---------- 盘中实时分时（东方财富 1分钟K线，当日） ----------
+@app.route('/api/minute_data')
+def minute_data():
     code = request.args.get('code', 'sh600036')
-    date_str = request.args.get('date', '')  # 格式 YYYYMMDD
-    if not date_str:
-        date_str = datetime.now().strftime('%Y%m%d')
     secid = code_to_eastmoney_secid(code)
     try:
-        # 东方财富 1分钟K线接口
+        # 用今天的日期
+        today = datetime.now().strftime('%Y%m%d')
         url = "http://push2his.eastmoney.com/api/qt/stock/kline/get"
         params = {
             'secid': secid,
             'fields1': 'f1,f2,f3,f4,f5,f6',
             'fields2': 'f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61',
-            'klt': '1',           # 1分钟
-            'fqt': '0',           # 不复权
-            'end': date_str,      # 目标日期
-            'lmt': '240'          # 最大获取240条
+            'klt': '1',       # 1分钟
+            'fqt': '0',
+            'end': today,
+            'lmt': '240'
         }
         headers = {'Referer': 'https://quote.eastmoney.com/'}
         resp = requests.get(url, params=params, headers=headers, timeout=10)
-        resp.encoding = 'utf-8'
         result = resp.json()
         if result.get('data') and result['data'].get('klines'):
             lines = result['data']['klines']
@@ -88,48 +80,59 @@ def hist_minute_data():
             for line in lines:
                 parts = line.split(',')
                 if len(parts) >= 6:
-                    # 时间,开盘,收盘,最高,最低,成交量,成交额,振幅,涨跌幅,涨跌额,换手率
-                    time_str = parts[0][-8:]  # 取后8位，如 "09:30:00"
+                    time_str = parts[0][-8:]  # 例如 "09:30:00"
                     data.append({
                         "time": time_str[:5],  # "09:30"
-                        "price": float(parts[2]),  # 收盘价作为价格代表
+                        "price": float(parts[2]),
                         "volume": int(parts[5])
                     })
             trade_date = lines[0].split(',')[0][:10]
-            return jsonify({"success": True, "data": data, "trade_date": trade_date, "source": "东方财富 (历史复盘)"})
+            return jsonify({"success": True, "data": data, "source": "东方财富 (当日)"})
         else:
-            return jsonify({"error": "未获取到历史分时数据，可能非交易日或代码有误"}), 404
+            return jsonify({"error": "暂无盘中分时数据"}), 404
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# ---------- 盘口（MOOTDX） ----------
-@app.route('/api/quote')
-def quote():
+# ---------- 历史分时（同东方财富，可指定日期） ----------
+@app.route('/api/hist_minute_data')
+def hist_minute_data():
     code = request.args.get('code', 'sh600036')
-    market, raw_code = code_to_market(code)
+    date_str = request.args.get('date', datetime.now().strftime('%Y%m%d'))
+    secid = code_to_eastmoney_secid(code)
     try:
-        res = tdx_client.quotes(symbol=raw_code, market=market)
-        if res is None or res.empty:
-            return jsonify({"error": "获取盘口失败"}), 404
-        row = res.iloc[0]
-        return jsonify({
-            "name": row.get('name', ''),
-            "price": float(row['price']),
-            "last_close": float(row['last_close']),
-            "open": float(row['open']),
-            "high": float(row['high']),
-            "low": float(row['low']),
-            "volume": int(row['volume']),
-            "amount": float(row['amount']),
-            "buy1": float(row['buy1']),
-            "sell1": float(row['sell1']),
-            "bp1": int(row['bp1']),
-            "sp1": int(row['sp1']),
-        })
+        url = "http://push2his.eastmoney.com/api/qt/stock/kline/get"
+        params = {
+            'secid': secid,
+            'fields1': 'f1,f2,f3,f4,f5,f6',
+            'fields2': 'f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61',
+            'klt': '1',
+            'fqt': '0',
+            'end': date_str,
+            'lmt': '240'
+        }
+        headers = {'Referer': 'https://quote.eastmoney.com/'}
+        resp = requests.get(url, params=params, headers=headers, timeout=10)
+        result = resp.json()
+        if result.get('data') and result['data'].get('klines'):
+            lines = result['data']['klines']
+            data = []
+            for line in lines:
+                parts = line.split(',')
+                if len(parts) >= 6:
+                    time_str = parts[0][-8:]
+                    data.append({
+                        "time": time_str[:5],
+                        "price": float(parts[2]),
+                        "volume": int(parts[5])
+                    })
+            trade_date = lines[0].split(',')[0][:10]
+            return jsonify({"success": True, "data": data, "trade_date": trade_date, "source": "东方财富 (历史)"})
+        else:
+            return jsonify({"error": "未获取到历史分时数据"}), 404
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# ---------- 前端页面（同之前，无变化） ----------
+# ---------- 前端页面（同之前，修改了盘口显示字段） ----------
 HTML_TEMPLATE = r"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -169,8 +172,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             <span>最新价: <b id="q_price">--</b></span>
             <span>涨幅: <b id="q_pct">--</b></span>
             <span>成交量: <b id="q_vol">--</b></span>
-            <span>买一: <b id="q_buy1">--</b></span>
-            <span>卖一: <b id="q_sell1">--</b></span>
         </div>
         <div class="sub-tab">
             <button id="btn_realtime" onclick="switchToRealtime()" style="font-weight:bold;">盘中实时</button>
@@ -216,14 +217,12 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             fetch('/api/quote?code=' + currentCode)
                 .then(r => r.json())
                 .then(d => {
-                    if (d && d.name) {
-                        document.getElementById('stockTitle').innerText = d.name + ' (' + currentCode + ')';
-                        document.getElementById('q_price').innerText = d.price;
-                        let pct = ((d.price - d.last_close) / d.last_close * 100).toFixed(2);
+                    if (d && !d.error) {
+                        document.getElementById('stockTitle').innerText = (d.name || currentCode) + ' (' + currentCode + ')';
+                        document.getElementById('q_price').innerText = d.price || '--';
+                        let pct = d.last_close ? ((d.price - d.last_close) / d.last_close * 100).toFixed(2) : '--';
                         document.getElementById('q_pct').innerText = pct + '%';
-                        document.getElementById('q_vol').innerText = d.volume;
-                        document.getElementById('q_buy1').innerText = d.buy1 + '(' + d.bp1 + ')';
-                        document.getElementById('q_sell1').innerText = d.sell1 + '(' + d.sp1 + ')';
+                        document.getElementById('q_vol').innerText = d.volume || '--';
                     }
                 }).catch(() => {});
         }
@@ -235,7 +234,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 .then(res => {
                     if (res.success) {
                         drawChart(res.data);
-                        document.getElementById('data_source').innerText = '数据来源：MOOTDX（盘中实时）';
+                        document.getElementById('data_source').innerText = '数据来源：东方财富（当日分时）';
                     } else {
                         document.getElementById('chart-container').innerHTML = '<p>暂无盘中分时数据，可切换至“盘后复盘”</p>';
                         document.getElementById('data_source').innerText = '';
