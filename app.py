@@ -1,9 +1,9 @@
 import os
 import requests
-import json
 from flask import Flask, jsonify, render_template_string, request
 import pandas as pd
 from datetime import datetime
+import akshare as ak
 
 app = Flask(__name__)
 
@@ -47,7 +47,6 @@ def quote():
             "low": data.get('f45', 0) / 100 if data.get('f45') else 0,
             "volume": data.get('f47', 0),
             "amount": data.get('f48', 0),
-            # 东方财富免费接口一般不提供五档盘口，可留空
             "buy1": "-", "sell1": "-", "bp1": "-", "sp1": "-"
         })
     except Exception as e:
@@ -59,7 +58,6 @@ def minute_data():
     code = request.args.get('code', 'sh600036')
     secid = code_to_eastmoney_secid(code)
     try:
-        # 用今天的日期
         today = datetime.now().strftime('%Y%m%d')
         url = "http://push2his.eastmoney.com/api/qt/stock/kline/get"
         params = {
@@ -132,7 +130,29 @@ def hist_minute_data():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# ---------- 前端页面（同之前，修改了盘口显示字段） ----------
+# ---------- 分时成交明细（AKShare tick 数据） ----------
+@app.route('/api/tick_data')
+def tick_data():
+    code = request.args.get('code', 'sh688981')
+    try:
+        df = ak.stock_zh_a_tick_tx_js(symbol=code)
+        data = []
+        for _, row in df.iterrows():
+            time_val = str(row.get('成交时间', row.get('时间', '')))
+            price = row.get('成交价格', row.get('价格', 0))
+            volume = row.get('成交量', 0)
+            nature = row.get('性质', '')
+            direction = 'B' if '买' in str(nature) else 'S'
+            data.append({
+                '时间': time_val,
+                '价格': price,
+                '成交': f"{int(volume)} {direction}"
+            })
+        return jsonify(data)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# ---------- 前端页面（整合所有功能） ----------
 HTML_TEMPLATE = r"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -153,6 +173,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         #chart-container { width: 100%; height: 400px; }
         .sub-tab { margin: 5px 0; }
         .sub-tab button { padding: 6px 12px; font-size: 14px; }
+        #tick-table-container { height: 400px; overflow-y: auto; border: 1px solid #ccc; margin-top: 20px; }
+        #tick-table { width: 100%; border-collapse: collapse; font-family: monospace; }
+        #tick-table th { position: sticky; top: 0; background: #f2f2f2; }
     </style>
 </head>
 <body>
@@ -180,6 +203,21 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         </div>
         <div id="chart-container"></div>
         <div id="data_source" style="font-size:12px; color:#888;"></div>
+
+        <!-- 分时成交明细表格 -->
+        <div id="tick-table-container">
+            <table id="tick-table">
+                <thead>
+                    <tr>
+                        <th style="padding: 8px; border-bottom: 1px solid #ddd;">时间</th>
+                        <th style="padding: 8px; border-bottom: 1px solid #ddd;">价格</th>
+                        <th style="padding: 8px; border-bottom: 1px solid #ddd;">成交</th>
+                    </tr>
+                </thead>
+                <tbody id="tick-table-body">
+                </tbody>
+            </table>
+        </div>
     </div>
 
     <div id="kline" class="tabcontent">
@@ -199,6 +237,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             openTab(null, 'timeline');
             loadQuote();
             loadMinuteData();
+            loadTickData(currentCode);
         };
 
         function switchStock() {
@@ -211,6 +250,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             loadQuote();
             if (activeSubTab === 'realtime') loadMinuteData();
             else loadHistData();
+            loadTickData(currentCode);
         }
 
         function loadQuote() {
@@ -288,6 +328,28 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                     { name: '成交量', type: 'bar', data: volumes, xAxisIndex: 1, yAxisIndex: 1 }
                 ]
             });
+        }
+
+        // 加载分时成交明细
+        function loadTickData(code) {
+            fetch('/api/tick_data?code=' + code)
+                .then(r => r.json())
+                .then(data => {
+                    const tbody = document.getElementById('tick-table-body');
+                    tbody.innerHTML = '';
+                    data.forEach(row => {
+                        const tr = document.createElement('tr');
+                        const isBuy = row['成交'].includes('B');
+                        tr.style.color = isBuy ? '#e74c3c' : '#2ecc71';
+                        tr.innerHTML = `<td style="padding:4px 8px;border-bottom:1px solid #eee;">${row['时间']}</td>
+                                        <td style="padding:4px 8px;border-bottom:1px solid #eee;">${row['价格']}</td>
+                                        <td style="padding:4px 8px;border-bottom:1px solid #eee;">${row['成交']}</td>`;
+                        tbody.appendChild(tr);
+                    });
+                    const container = document.getElementById('tick-table-container');
+                    container.scrollTop = container.scrollHeight;
+                })
+                .catch(e => console.error(e));
         }
 
         function switchToRealtime() {
