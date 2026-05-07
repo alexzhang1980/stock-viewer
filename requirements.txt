@@ -1,5 +1,9 @@
+--index-url https://mirrors.aliyun.com/pypi/simple/
+--trusted-host mirrors.aliyun.com
+
 flask
 requests
-mootdx
-pandas
+numpy<2.0
+pandas<2.0
 akshare
+mootdx
