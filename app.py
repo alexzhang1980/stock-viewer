@@ -18,8 +18,11 @@ def code_to_eastmoney_secid(code):
         market = '1' if code.startswith('6') else '0'
         return f"{market}.{code}"
 
-# ---------- 目标股池 ----------
 STOCK_LIST = ['sh688981', 'sz002371', 'sh603501', 'sh688041', 'sh688256', 'sh603986']
+
+def normalize_symbol(code):
+    """统一转为AKShare格式（无前缀纯数字）"""
+    return code.replace('.', '').replace('sz', '').replace('SZ', '').replace('sh', '').replace('SH', '')
 
 # ---------- 批量实时行情 ----------
 @app.route('/api/batch_quote')
@@ -32,7 +35,7 @@ def batch_quote():
             url = "https://push2.eastmoney.com/api/qt/stock/get"
             params = {
                 'secid': secid,
-                'fields': 'f43,f44,f45,f46,f47,f48,f50,f57,f58,f60,f169,f170',
+                'fields': 'f43,f44,f45,f46,f47,f48,f50,f57,f58,f60',
                 'invt': '2',
                 'fltt': '2'
             }
@@ -54,55 +57,96 @@ def batch_quote():
             result[code] = {"error": str(e)}
     return jsonify(result)
 
-# ---------- 全量盘口信息 ----------
-@app.route('/api/quote/<code>')
-def quote_detail(code):
+# ---------- 均价（通过分时接口计算VWAP） ----------
+@app.route('/api/avg_price')
+def avg_price():
+    """获取股票的分时均价线"""
+    code = request.args.get('code', 'sh688981')
     secid = code_to_eastmoney_secid(code)
     try:
-        url = "https://push2.eastmoney.com/api/qt/stock/get"
-        # 聚合常用字段 + 五档盘口 (买一至买五/卖一至卖五)
-        fields = ('f43,f44,f45,f46,f47,f48,f50,f57,f58,f60,f169,f170,'
-                  'f19,f20,f21,f22,f23,f24,f25,f26,f27,f28,f29,f30,f31,f32,f33,f34,f35,f36,f37')
-        params = {'secid': secid, 'fields': fields, 'invt': '2', 'fltt': '2'}
+        url = "http://push2his.eastmoney.com/api/qt/stock/trends2/get"
+        params = {
+            'secid': secid,
+            'fields1': 'f1,f2,f3,f4,f5,f6,f7,f8,f9,f10,f11,f12,f13',
+            'fields2': 'f51,f52,f53,f54,f55,f56,f57,f58',
+            'iscr': '0',
+            'ndays': '1'
+        }
         h = {'Referer': 'https://quote.eastmoney.com/'}
-        r = requests.get(url, params=params, headers=h, timeout=5)
-        d = r.json().get('data', {})
-        if not d:
-            return jsonify({"error": "no data"}), 404
+        r = requests.get(url, params=params, headers=h, timeout=8)
+        result = r.json()
 
-        # 辅助解析价格(÷100) / 成交量(手)
-        def p(field): return d.get(field, 0) / 100 if d.get(field) else 0
-        def vol(field): return int(d.get(field, 0) or 0)
+        if result.get('data') and result['data'].get('trends'):
+            lines = result['data']['trends']
+            cumulative_amount = 0.0   # 累计成交额
+            cumulative_volume = 0.0   # 累计成交量
+            latest_avg = 0.0
+            for line in lines:
+                parts = line.split(',')
+                if len(parts) >= 8:
+                    price = float(parts[3])        # f54: 当前价
+                    cum_v = float(parts[6])        # f57: 累计成交量（当日）
+                    cum_a = float(parts[7])        # f58: 累计成交额（当日）
+                    cumulative_volume = cum_v
+                    cumulative_amount = cum_a
+            if cumulative_volume > 0:
+                latest_avg = round(cumulative_amount / cumulative_volume, 2)
+            # 下一行即均价计算公式：成交均价 = 累计成交总金额 ÷ 累计成交总股数[reference:0]
+            return jsonify({"success": True, "avg_price": latest_avg, "code": code})
+        else:
+            return jsonify({"error": "暂无分时数据"}), 404
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
-        buy5 = [
-            {"price": p('f19'), "volume": vol('f20')},
-            {"price": p('f21'), "volume": vol('f22')},
-            {"price": p('f23'), "volume": vol('f24')},
-            {"price": p('f25'), "volume": vol('f26')},
-            {"price": p('f27'), "volume": vol('f28')},
-        ]
-        sell5 = [
-            {"price": p('f29'), "volume": vol('f30')},
-            {"price": p('f31'), "volume": vol('f32')},
-            {"price": p('f33'), "volume": vol('f34')},
-            {"price": p('f35'), "volume": vol('f36')},
-            {"price": p('f37'), "volume": vol('f38')},
-        ]
-
+# ---------- 主动买/主动卖统计 ----------
+@app.route('/api/adv_stats_brief')
+def adv_stats_brief():
+    """返回主动买成交量、主动卖成交量"""
+    code = request.args.get('code', 'sh688981')
+    symbol = normalize_symbol(code)
+    try:
+        df = ak.stock_zh_a_tick_tx_js(symbol=symbol)
+        if df is None or df.empty:
+            return jsonify({"error": "no tick data"}), 404
+        df['性质'] = df['性质'].astype(str)
+        df['方向'] = df['性质'].apply(lambda x: 'B' if '买' in x else 'S')
+        df['成交量'] = pd.to_numeric(df['成交量'], errors='coerce').fillna(0)
+        buy_vol = int(df[df['方向'] == 'B']['成交量'].sum()) if not df.empty else 0
+        sell_vol = int(df[df['方向'] == 'S']['成交量'].sum()) if not df.empty else 0
+        # 主动买/主动卖统计口径：累计主动买入成交量 vs 累计主动卖出成交量[reference:1]
         return jsonify({
-            "name": d.get('f58', ''),
-            "price": d.get('f43', 0) / 100 if d.get('f43') else 0,
-            "last_close": d.get('f60', 0) / 100 if d.get('f60') else 0,
-            "volume": d.get('f47', 0),
-            "amount": d.get('f48', 0),
-            "volume_ratio": d.get('f50', 0) / 100 if d.get('f50') else 0,
-            "buy5": buy5,
-            "sell5": sell5
+            "buy_vol": buy_vol,
+            "sell_vol": sell_vol,
+            "code": code
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# ---------- 分钟K线 ----------
+# ---------- 大单占比 ----------
+@app.route('/api/big_order_ratio')
+def big_order_ratio():
+    """返回大单占比"""
+    code = request.args.get('code', 'sh688981')
+    symbol = normalize_symbol(code)
+    try:
+        df = ak.stock_zh_a_tick_tx_js(symbol=symbol)
+        if df is None or df.empty:
+            return jsonify({"error": "no tick data"}), 404
+        df['成交量'] = pd.to_numeric(df['成交量'], errors='coerce').fillna(0)
+        total_vol = df['成交量'].sum()
+        big_threshold = 500  # 大单阈值：≥500手
+        big_vol = df[df['成交量'] >= big_threshold]['成交量'].sum()
+        ratio = round(big_vol / total_vol * 100, 1) if total_vol > 0 else 0
+        # 大单阈值：成交量≥500手划定为大单，按行业通行标准执行[reference:2]
+        return jsonify({
+            "big_ratio": ratio,
+            "big_threshold": 500,
+            "code": code
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# ---------- 分钟K线（分时图用） ----------
 @app.route('/api/minute_kline/<code>')
 def minute_kline(code):
     secid = code_to_eastmoney_secid(code)
@@ -136,10 +180,56 @@ def minute_kline(code):
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# ---------- 分时成交明细（增强版） ----------
+# ---------- 单股盘口（保留原有接口） ----------
+@app.route('/api/quote/<code>')
+def quote_detail(code):
+    secid = code_to_eastmoney_secid(code)
+    try:
+        url = "https://push2.eastmoney.com/api/qt/stock/get"
+        fields = ('f43,f44,f45,f46,f47,f48,f50,f57,f58,f60,f169,f170,'
+                  'f19,f20,f21,f22,f23,f24,f25,f26,f27,f28,f29,f30,f31,f32,f33,f34,f35,f36,f37')
+        params = {'secid': secid, 'fields': fields, 'invt': '2', 'fltt': '2'}
+        h = {'Referer': 'https://quote.eastmoney.com/'}
+        r = requests.get(url, params=params, headers=h, timeout=5)
+        d = r.json().get('data', {})
+        if not d:
+            return jsonify({"error": "no data"}), 404
+
+        def p(field): return d.get(field, 0) / 100 if d.get(field) else 0
+        def vol(field): return int(d.get(field, 0) or 0)
+
+        buy5 = [
+            {"price": p('f19'), "volume": vol('f20')},
+            {"price": p('f21'), "volume": vol('f22')},
+            {"price": p('f23'), "volume": vol('f24')},
+            {"price": p('f25'), "volume": vol('f26')},
+            {"price": p('f27'), "volume": vol('f28')},
+        ]
+        sell5 = [
+            {"price": p('f29'), "volume": vol('f30')},
+            {"price": p('f31'), "volume": vol('f32')},
+            {"price": p('f33'), "volume": vol('f34')},
+            {"price": p('f35'), "volume": vol('f36')},
+            {"price": p('f37'), "volume": vol('f38')},
+        ]
+
+        return jsonify({
+            "name": d.get('f58', ''),
+            "price": d.get('f43', 0) / 100 if d.get('f43') else 0,
+            "last_close": d.get('f60', 0) / 100 if d.get('f60') else 0,
+            "volume": d.get('f47', 0),
+            "amount": d.get('f48', 0),
+            "volume_ratio": d.get('f50', 0) / 100 if d.get('f50') else 0,
+            "buy5": buy5,
+            "sell5": sell5
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# ---------- 分时成交明细（详情页用） ----------
 @app.route('/api/tick_data/<code>')
 def tick_data(code):
-    symbol = code.replace('.', '').replace('SZ', 'sz').replace('SH', 'sh')
+    symbol = normalize_symbol(code)
     try:
         df = ak.stock_zh_a_tick_tx_js(symbol=symbol)
         if df is None or df.empty:
@@ -172,10 +262,10 @@ def tick_data(code):
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# ---------- 资金强度统计 ----------
+# ---------- 资金强度统计（详情页用） ----------
 @app.route('/api/adv_stats/<code>')
 def adv_stats(code):
-    symbol = code.replace('.', '').replace('SZ', 'sz').replace('SH', 'sh')
+    symbol = normalize_symbol(code)
     try:
         df = ak.stock_zh_a_tick_tx_js(symbol=symbol)
         if df is None or df.empty:
@@ -207,7 +297,7 @@ def adv_stats(code):
         return jsonify({"error": str(e)}), 500
 
 # ============================================================
-# 仪表盘模板
+# 仪表盘模板（新增7项补充指标 + 修复东北制药前缀）
 # ============================================================
 HTML_DASHBOARD = r"""
 <!DOCTYPE html>
@@ -219,13 +309,16 @@ HTML_DASHBOARD = r"""
     <style>
         body { font-family: Arial; margin: 20px; background: #f5f5f5; }
         .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 15px; }
-        .card { background: #fff; border-radius: 10px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); padding: 12px; min-height: 180px; }
+        .card { background: #fff; border-radius: 10px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); padding: 12px; min-height: 280px; }
         .card h3 { margin:0 0 8px; font-size: 16px; }
-        .metrics { display:flex; justify-content: space-between; font-size: 14px; }
+        .metrics { display:flex; justify-content: space-between; font-size: 13px; margin: 3px 0; }
         .up { color: #e74c3c; } .down { color: #2ecc71; }
-        .sparkline { width:100%; height:60px; }
-        .leader-badge { font-size:12px; padding:2px 6px; border-radius:4px; margin-left:6px; color:#fff; }
+        .sparkline { width:100%; height:45px; }
+        .leader-badge { font-size:11px; padding:1px 5px; border-radius:3px; margin-left:4px; color:#fff; }
         .badge-strong { background:#e67e22; } .badge-resistant { background:#3498db; } .badge-volume { background:#9b59b6; }
+        .extra-label { color:#888; font-size:12px; }
+        .extra-value { font-weight:bold; font-size:13px; }
+        .section-line { border-top:1px dashed #ddd; margin:8px 0 4px; padding-top:4px; }
     </style>
 </head>
 <body>
@@ -249,6 +342,7 @@ HTML_DASHBOARD = r"""
                 s.isVolumeUp = s.volume_ratio === maxVratio;
                 s.isVolumeDown = s.volume_ratio === minVratio && minVratio < 0.8;
             });
+
             const grid = document.getElementById('stockGrid');
             grid.innerHTML = '';
             for (let s of stats) {
@@ -261,13 +355,35 @@ HTML_DASHBOARD = r"""
                 if (s.isVolumeUp) badge += '<span class="leader-badge badge-volume">放量</span>';
                 else if (s.isVolumeDown) badge += '<span class="leader-badge badge-volume">缩量</span>';
                 const chgPercent = s.last_close ? ((s.price - s.last_close)/s.last_close*100).toFixed(2) : 0;
-                card.innerHTML = `<h3>${s.name || s.code} ${badge}</h3>
-                    <div class="metrics"><span>最新</span><span class="${chgPercent>=0?'up':'down'}">${s.price.toFixed(2)}</span></div>
-                    <div class="metrics"><span>涨幅</span><span class="${chgPercent>=0?'up':'down'}">${chgPercent}%</span></div>
-                    <div class="metrics"><span>量比</span><span>${(s.volume_ratio||0).toFixed(2)}</span></div>
-                    <div id="chart_${s.code}" class="sparkline"></div>`;
+                const chgClass = chgPercent >= 0 ? 'up' : 'down';
+
+                card.innerHTML = `
+                    <h3>${s.name || s.code} ${badge}</h3>
+                    <div class="metrics">
+                        <span>最新</span>
+                        <span class="${chgClass}">${s.price.toFixed(2)}</span>
+                        <span>涨幅</span>
+                        <span class="${chgClass}">${chgPercent}%</span>
+                        <span>量比</span>
+                        <span>${(s.volume_ratio||0).toFixed(2)}</span>
+                    </div>
+                    <div id="chart_${s.code}" class="sparkline"></div>
+                    <div class="section-line"></div>
+                    <div id="extra_${s.code}" style="font-size:12px;">
+                        <div class="metrics"><span class="extra-label">①当前价:</span><span>--</span></div>
+                        <div class="metrics"><span class="extra-label">②均价:</span><span>--</span></div>
+                        <div class="metrics"><span class="extra-label">③分时:</span><span>--</span></div>
+                        <div class="metrics"><span class="extra-label">④主动买:</span><span>--</span></div>
+                        <div class="metrics"><span class="extra-label">⑤主动卖:</span><span>--</span></div>
+                        <div class="metrics"><span class="extra-label">⑥是否放量:</span><span>--</span></div>
+                        <div class="metrics"><span class="extra-label">⑦大单情况:</span><span>--</span></div>
+                    </div>
+                `;
                 grid.appendChild(card);
+                // 加载微型分时图
                 loadSparkline(s.code, 'chart_'+s.code);
+                // 加载补充数据
+                loadExtraInfo(s.code, 'extra_'+s.code);
             }
         }
 
@@ -291,6 +407,90 @@ HTML_DASHBOARD = r"""
             }
         }
 
+        async function loadExtraInfo(code, containerId) {
+            const container = document.getElementById(containerId);
+            if (!container) return;
+            const rows = container.querySelectorAll('.metrics');
+
+            // ①当前价: 从batch_quote里已拿到，直接从卡片上层取值
+            // 这里同步该价格
+            try {
+                const qResp = await fetch('/api/batch_quote?codes='+code);
+                const qData = await qResp.json();
+                if (qData[code] && qData[code].price) {
+                    rows[0].querySelectorAll('span')[1].innerText = qData[code].price.toFixed(2);
+                }
+            } catch(e) {}
+
+            // ②均价: 通过分时VWAP接口获取
+            try {
+                const avgResp = await fetch('/api/avg_price?code='+code);
+                const avgData = await avgResp.json();
+                if (avgData.success && avgData.avg_price) {
+                    rows[1].querySelectorAll('span')[1].innerText = avgData.avg_price.toFixed(2);
+                } else {
+                    rows[1].querySelectorAll('span')[1].innerText = '--';
+                }
+            } catch(e) { rows[1].querySelectorAll('span')[1].innerText = '--'; }
+
+            // ③分时: 取最近一分钟的收盘价
+            try {
+                const mResp = await fetch('/api/minute_kline/'+code);
+                const mData = await mResp.json();
+                if (mData.success && mData.data.length > 0) {
+                    const latest = mData.data[mData.data.length - 1];
+                    rows[2].querySelectorAll('span')[1].innerText = latest.close.toFixed(2);
+                } else {
+                    rows[2].querySelectorAll('span')[1].innerText = '--';
+                }
+            } catch(e) { rows[2].querySelectorAll('span')[1].innerText = '--'; }
+
+            // ④主动买 & ⑤主动卖: 从tick数据统计
+            try {
+                const tickResp = await fetch('/api/adv_stats_brief?code='+code);
+                const tickData = await tickResp.json();
+                if (tickData.buy_vol !== undefined) {
+                    rows[3].querySelectorAll('span')[1].innerText = tickData.buy_vol + '手';
+                    rows[4].querySelectorAll('span')[1].innerText = tickData.sell_vol + '手';
+                } else {
+                    rows[3].querySelectorAll('span')[1].innerText = '--';
+                    rows[4].querySelectorAll('span')[1].innerText = '--';
+                }
+            } catch(e) {
+                rows[3].querySelectorAll('span')[1].innerText = '--';
+                rows[4].querySelectorAll('span')[1].innerText = '--';
+            }
+
+            // ⑥是否放量: 量比 ≥ 1.5 即认为放量
+            try {
+                const q2Resp = await fetch('/api/batch_quote?codes='+code);
+                const q2Data = await q2Resp.json();
+                if (q2Data[code] && q2Data[code].volume_ratio !== undefined) {
+                    const vr = q2Data[code].volume_ratio;
+                    const isBurst = vr >= 1.5;
+                    rows[5].querySelectorAll('span')[1].innerText = isBurst ? '✅ 放量' : '正常';
+                    rows[5].querySelectorAll('span')[1].style.color = isBurst ? '#e74c3c' : '#888';
+                }
+                // 放量判定：量比≥1.5视为放量，表明当日成交活跃度明显高于近期平均水平[reference:3]
+            } catch(e) { rows[5].querySelectorAll('span')[1].innerText = '--'; }
+
+            // ⑦大单情况: 大单占比
+            try {
+                const bigResp = await fetch('/api/big_order_ratio?code='+code);
+                const bigData = await bigResp.json();
+                if (bigData.big_ratio !== undefined) {
+                    rows[6].querySelectorAll('span')[1].innerText = bigData.big_ratio + '%';
+                    if (bigData.big_ratio >= 20) {
+                        rows[6].querySelectorAll('span')[1].style.color = '#e74c3c';
+                    } else {
+                        rows[6].querySelectorAll('span')[1].style.color = '#333';
+                    }
+                } else {
+                    rows[6].querySelectorAll('span')[1].innerText = '--';
+                }
+            } catch(e) { rows[6].querySelectorAll('span')[1].innerText = '--'; }
+        }
+
         window.onload = loadDashboard;
     </script>
 </body>
@@ -298,7 +498,7 @@ HTML_DASHBOARD = r"""
 """
 
 # ============================================================
-# 单股详情模板
+# 单股详情模板（保持不变）
 # ============================================================
 HTML_STOCK_DETAIL = r"""
 <!DOCTYPE html>
