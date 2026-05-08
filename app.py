@@ -1,5 +1,4 @@
 from flask import Flask, jsonify, render_template_string, request
-import requests
 import time
 import statistics
 import traceback
@@ -7,59 +6,80 @@ import traceback
 app = Flask(__name__)
 
 STOCKS = [
-    {"name": "中芯国际", "code": "688981", "secid": "1.688981"},
-    {"name": "兆易创新", "code": "603986", "secid": "1.603986"},
-    {"name": "寒武纪", "code": "688256", "secid": "1.688256"},
-    {"name": "北方华创", "code": "002371", "secid": "0.002371"},
-    {"name": "海光信息", "code": "688041", "secid": "1.688041"},
-    {"name": "豪威集团", "code": "603501", "secid": "1.603501"},
+    {"name": "中芯国际", "code": "688981", "market": 1, "symbol": "688981"},
+    {"name": "兆易创新", "code": "603986", "market": 1, "symbol": "603986"},
+    {"name": "寒武纪", "code": "688256", "market": 1, "symbol": "688256"},
+    {"name": "北方华创", "code": "002371", "market": 0, "symbol": "002371"},
+    {"name": "海光信息", "code": "688041", "market": 1, "symbol": "688041"},
+    {"name": "豪威集团", "code": "603501", "market": 1, "symbol": "603501"},
 ]
 
 
-def safe_float(x, div=1):
-    """安全转换为浮点数，可指定除数"""
+# ===================== 通达信数据获取 =====================
+# 延迟导入，避免模块不存在时报错
+def get_tdx_client():
+    from mootdx.quotes import Quotes
+    # 直接指定通达信行情服务器，跳过 bestip 测速
+    return Quotes.factory(market='std', host='119.147.86.171', port=7709, timeout=10)
+
+
+def fetch_quote_tdx(client, symbol, market):
+    """通过通达信协议获取实时行情"""
     try:
-        if x is None or x == "-":
-            return None
-        return round(float(x) / div, 2)
-    except (ValueError, TypeError):
-        return None
+        res = client.quotes(symbol=symbol, market=market)
+        if res is None or res.empty:
+            return {}
+        row = res.iloc[0]
+        price = float(row.get('price', 0))
+        pre_close = float(row.get('last_close', price))
+        outer = int(row.get('outer', 0) or 0)
+        inner = int(row.get('inner', 0) or 0)
+        return {
+            "price": round(price, 2),
+            "high": round(float(row.get('high', 0)), 2),
+            "low": round(float(row.get('low', 0)), 2),
+            "open": round(float(row.get('open', 0)), 2),
+            "volume": int(row.get('volume', 0)),
+            "amount": round(float(row.get('amount', 0)) / 1e8, 2),  # 元转亿
+            "pre_close": round(pre_close, 2),
+            "pct": round((price - pre_close) / pre_close * 100, 2) if pre_close else 0,
+            "turnover": round(float(row.get('turnover', 0)) / 100, 2),  # 换手率
+            "float_cap": round(float(row.get('mktcap', 0)) / 1e8, 2),  # 总市值
+            "outer": outer,
+            "inner": inner,
+        }
+    except Exception as e:
+        print(f"通达信行情获取失败 {symbol}: {e}")
+        return {}
 
 
-def fetch_quote(secid):
-    url = "https://push2.eastmoney.com/api/qt/stock/get"
-    params = {
-        "secid": secid,
-        "fields": "f43,f44,f45,f46,f47,f48,f60,f170,f171,f168,f169,f170,f116,f117,f49,f161",
-        "_": int(time.time() * 1000),
-    }
-    r = requests.get(url, params=params, timeout=6)
-    data = r.json().get("data") or {}
-
-    # 昨收单独取，用于价格为空时的保底
-    pre_close = safe_float(data.get("f60"), 100)
-    price = safe_float(data.get("f43"), 100)
-    if price is None:
-        price = pre_close  # 非交易时段显示昨收
-
-    return {
-        "price": price,
-        "high": safe_float(data.get("f44"), 100),
-        "low": safe_float(data.get("f45"), 100),
-        "open": safe_float(data.get("f46"), 100),
-        "volume": safe_float(data.get("f47")),          # 手，不除以100
-        "amount": safe_float(data.get("f48"), 100000000), # 元转亿
-        "pre_close": pre_close,
-        "pct": safe_float(data.get("f170"), 100),        # 涨跌幅，已带%
-        "turnover": safe_float(data.get("f168"), 100),   # 换手率，%
-        "market_cap": safe_float(data.get("f116"), 100000000), # 总市值，元转亿
-        "float_cap": safe_float(data.get("f117"), 100000000),  # 流通市值
-        "outer": safe_float(data.get("f49")),            # 外盘
-        "inner": safe_float(data.get("f161")),           # 内盘
-    }
+def fetch_trend_tdx(client, symbol, market):
+    """通过通达信协议获取分时数据"""
+    try:
+        df = client.minute(symbol=symbol, market=market)
+        if df is None or df.empty:
+            return []
+        rows = []
+        for _, row in df.iterrows():
+            t = str(row.get('time', row.get('分钟', '')))
+            if len(t) == 4:
+                t = t[:2] + ':' + t[2:]
+            rows.append({
+                "time": t,
+                "price": round(float(row['price']), 2),
+                "avg": round(float(row['avg']), 2) if 'avg' in row else round(float(row['price']), 2),
+                "volume": int(row['volume']),
+            })
+        return rows
+    except Exception as e:
+        print(f"通达信分时获取失败 {symbol}: {e}")
+        # 尝试从东方财富获取分时数据作为备用
+        return fetch_trend_fallback(symbol, market)
 
 
-def fetch_trend(secid):
+def fetch_trend_fallback(symbol, market):
+    """东方财富分时数据（备用方案）"""
+    secid = f"{market}.{symbol}"
     url = "https://push2his.eastmoney.com/api/qt/stock/trends2/get"
     params = {
         "secid": secid,
@@ -68,33 +88,42 @@ def fetch_trend(secid):
         "iscr": "0",
         "iscca": "0",
         "ndays": "1",
-        "_": int(time.time() * 1000),
     }
-    r = requests.get(url, params=params, timeout=6)
-    trends = (r.json().get("data") or {}).get("trends") or []
+    try:
+        import requests as req
+        r = req.get(url, params=params, timeout=8)
+        trends = (r.json().get("data") or {}).get("trends") or []
+        rows = []
+        for item in trends:
+            p = item.split(",")
+            if len(p) >= 8:
+                time_str = p[0][-5:] if p[0] and len(p[0]) >= 5 else ""
+                rows.append({
+                    "time": time_str,
+                    "price": safe_float(p[1]),
+                    "avg": safe_float(p[2]),
+                    "volume": safe_float(p[5]),
+                })
+        return rows
+    except Exception:
+        return []
 
-    rows = []
-    for item in trends:
-        p = item.split(",")
-        if len(p) >= 8:
-            # 时间格式 2026-05-08 09:30:00 -> 取后5位 "09:30"
-            time_str = p[0][-5:] if p[0] and len(p[0]) >= 5 else ""
-            rows.append({
-                "time": time_str,
-                "price": safe_float(p[1]),
-                "avg": safe_float(p[2]),
-                "volume": safe_float(p[5]),
-                "amount": safe_float(p[6]),
-            })
-    return rows
+
+def safe_float(x, div=1):
+    try:
+        if x is None or x == "-":
+            return None
+        return round(float(x) / div, 2)
+    except (ValueError, TypeError):
+        return None
 
 
-def analyze(stock, quote, trend):
+# ===================== 分析函数 =====================
+def analyze(quote, trend):
     price = quote.get("price")
     pct = quote.get("pct")
     avg = None
     if trend:
-        # 有可能最后几个元素的avg为None，取最后一个有效值
         for point in reversed(trend):
             if point.get("avg") is not None:
                 avg = point["avg"]
@@ -125,7 +154,7 @@ def analyze(stock, quote, trend):
             score -= 1
             reasons.append("弱势震荡")
 
-    # 短线趋势判断（至少需要20个有效价格点）
+    # 短线趋势判断
     if len(prices) >= 20:
         recent = prices[-10:]
         earlier = prices[-30:-20] if len(prices) >= 30 else prices[:10]
@@ -167,18 +196,34 @@ def analyze(stock, quote, trend):
     }
 
 
+# ===================== API 路由 =====================
 @app.route("/api/data")
 def api_data():
     result = []
-    for s in STOCKS:
-        try:
-            quote = fetch_quote(s["secid"])
-            trend = fetch_trend(s["secid"])
-            decision = analyze(s, quote, trend)
+    try:
+        client = get_tdx_client()
+    except Exception as e:
+        # 通达信初始化失败，返回全部错误
+        for s in STOCKS:
             result.append({
                 "name": s["name"],
                 "code": s["code"],
-                "secid": s["secid"],
+                "error": f"通达信连接失败: {str(e)}",
+                "quote": {},
+                "trend": [],
+                "decision": {"score": 0, "action": "数据异常", "risk": "未知", "reasons": []},
+            })
+        return jsonify({"time": time.strftime("%H:%M:%S"), "sector": {"status": "系统错误", "strong": 0, "weak": 0, "above_avg": 0}, "stocks": result})
+
+    for s in STOCKS:
+        try:
+            quote = fetch_quote_tdx(client, s["symbol"], s["market"])
+            trend = fetch_trend_tdx(client, s["symbol"], s["market"])
+            decision = analyze(quote, trend)
+            result.append({
+                "name": s["name"],
+                "code": s["code"],
+                "secid": s["code"],
                 "quote": quote,
                 "trend": trend,
                 "decision": decision,
@@ -187,7 +232,7 @@ def api_data():
             result.append({
                 "name": s["name"],
                 "code": s["code"],
-                "secid": s["secid"],
+                "secid": s["code"],
                 "error": str(e),
                 "quote": {},
                 "trend": [],
@@ -223,6 +268,7 @@ def api_data():
     })
 
 
+# ===================== 前端页面 =====================
 HTML = """
 <!DOCTYPE html>
 <html lang="zh">
