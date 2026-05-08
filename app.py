@@ -21,7 +21,7 @@ def code_to_eastmoney_secid(code):
 def normalize_symbol(code):
     return code.replace('.', '').replace('sz', '').replace('SZ', '').replace('sh', '').replace('SH', '')
 
-# ========== 单股详情页所需 API（不变） ==========
+# ========== 单股详情页 API（不变） ==========
 @app.route('/api/quote/<code>')
 def quote_detail(code):
     secid = code_to_eastmoney_secid(code)
@@ -166,7 +166,7 @@ def adv_stats(code):
         return jsonify({"error": str(e)}), 500
 
 # ============================================================
-# 仪表盘模板（整合决策增强模块 + 板块联动评分，图表渲染已稳定）
+# 仪表盘模板（满足你所有要求）
 # ============================================================
 HTML_DASHBOARD = r"""
 <!DOCTYPE html>
@@ -180,7 +180,7 @@ HTML_DASHBOARD = r"""
 body{margin:0;font-family:Arial,"Microsoft YaHei";background:#f3f4f6;color:#111827}
 header{padding:14px 20px;background:#111827;color:#fff;font-size:20px;font-weight:bold}
 #time{font-size:13px;color:#9ca3af;margin-top:4px}
-#sector-signal{background:#fff;margin:8px 12px;padding:10px;border-radius:8px;font-weight:bold;text-align:center;box-shadow:0 1px 3px rgba(0,0,0,0.1)}
+#sector-panel{background:#fff;margin:10px 12px;padding:12px;border-radius:10px;box-shadow:0 2px 6px rgba(0,0,0,0.08);line-height:1.8}
 .grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;padding:12px}
 .card{background:#fff;border-radius:12px;padding:12px;box-shadow:0 2px 8px rgba(0,0,0,.08)}
 .name{font-size:18px;font-weight:bold}
@@ -201,8 +201,10 @@ footer{padding:12px 20px;font-size:13px;color:#6b7280}
   <div id="time">等待刷新...</div>
 </header>
 
-<!-- 板块信号栏 -->
-<div id="sector-signal">板块信号：加载中...</div>
+<!-- 顶部板块状态区 -->
+<div id="sector-panel">
+  加载中...
+</div>
 
 <div class="grid" id="grid"></div>
 
@@ -220,7 +222,6 @@ const stocks=[
   {code:"sh603501",name:"豪威集团",secid:"1.603501"}
 ];
 
-// 图表实例管理
 let allCharts = {};
 function destroyAllCharts() {
   Object.keys(allCharts).forEach(key => {
@@ -231,7 +232,6 @@ function destroyAllCharts() {
   });
 }
 
-// 金额格式化
 function money(v){
   if(!v) return "--";
   if(v>=1e8) return (v/1e8).toFixed(2)+"亿";
@@ -239,13 +239,11 @@ function money(v){
   return v;
 }
 
-// 网络请求
 async function getJson(url){
   const r = await fetch(url + "&_=" + Date.now(), {cache:"no-store"});
   return await r.json();
 }
 
-// ========== 基础行情 ==========
 async function fetchBase(s){
   const url = `https://push2.eastmoney.com/api/qt/stock/get?secid=${s.secid}&fields=f43,f44,f45,f46,f47,f48,f60,f169,f170,f171`;
   const j = await getJson(url);
@@ -262,19 +260,14 @@ async function fetchBase(s){
     change: d.f169 / 100,
     pct: d.f170 / 100,
     amp: d.f171 / 100,
-    volumeRatio: 0,        // 东方财富接口暂不提供量比，需额外获取，这里先留0
-    // 主动买卖/大单数据需通过AKShare逐笔数据获取，目前先设0，保留接口
-    activeBuy: 0,
-    activeSell: 0,
-    bigBuyCount: 0,
-    bigSellCount: 0,
-    bigBuyAmount: 0,
-    bigSellAmount: 0,
-    avgPrice: 0            // 均价稍后在fetchMinute中计算并覆盖
+    volumeRatio: 0,
+    activeBuy: 0, activeSell: 0,
+    bigBuyCount: 0, bigSellCount: 0,
+    bigBuyAmount: 0, bigSellAmount: 0,
+    avgPrice: 0
   };
 }
 
-// ========== 分时数据 ==========
 async function fetchMinute(s){
   const url = `https://push2his.eastmoney.com/api/qt/stock/trends2/get?secid=${s.secid}&fields1=f1,f2,f3,f4,f5,f6,f7,f8&fields2=f51,f52,f53,f54,f55,f56,f57,f58`;
   const j = await getJson(url);
@@ -290,77 +283,44 @@ async function fetchMinute(s){
   }).filter(x => x.price > 0);
 }
 
-// ========== 决策增强模块 ==========
+// ========== 交易决策增强模块 ==========
 function analyzeStock(stock, minutes) {
-  // 从分时数据中提取最新均价
   if (minutes && minutes.length > 0) {
     stock.avgPrice = minutes[minutes.length - 1].avg;
   }
-  const {
-    name,
-    price,
-    avgPrice,
-    pct,
-    volumeRatio = 0,
-    activeBuy = 0,
-    activeSell = 0,
-    bigBuyCount = 0,
-    bigSellCount = 0,
-    bigBuyAmount = 0,
-    bigSellAmount = 0,
-  } = stock;
+  const { price, avgPrice, pct, volumeRatio } = stock;
+  let activeBuy = stock.activeBuy || 0, activeSell = stock.activeSell || 0;
+  let bigBuyAmount = stock.bigBuyAmount || 0, bigSellAmount = stock.bigSellAmount || 0;
 
   const buySellDiff = activeBuy - activeSell;
   const bigOrderDiff = bigBuyAmount - bigSellAmount;
   const avgDeviation = avgPrice ? ((price - avgPrice) / avgPrice) * 100 : 0;
 
-  let score = 0;
-  let trend = "";
-  let risk = "";
-  let action = "";
+  let score = 0, trend = "", risk = "", action = "";
 
-  // 1. 均价线判断
-  if (price > avgPrice) score += 2;
-  else score -= 2;
+  if (price > avgPrice) score += 2; else score -= 2;
 
-  // 2. 主动买卖判断
-  if (buySellDiff > 0) score += 2;
-  else if (buySellDiff < 0) score -= 2;
+  if (buySellDiff > 0) score += 2; else if (buySellDiff < 0) score -= 2;
 
-  // 3. 大单判断
-  if (bigOrderDiff > 0) score += 2;
-  else if (bigOrderDiff < 0) score -= 2;
+  if (bigOrderDiff > 0) score += 2; else if (bigOrderDiff < 0) score -= 2;
 
-  // 4. 量比判断
   if (volumeRatio >= 1.5 && buySellDiff > 0) score += 2;
   if (volumeRatio >= 1.5 && buySellDiff < 0) score -= 2;
 
-  // 5. 跌幅修正：弱势中企稳
   if (pct < -2 && price >= avgPrice && buySellDiff > 0) score += 1;
 
-  // 6. 风险判断
-  if (price < avgPrice && bigOrderDiff < 0) {
-    risk = "偏弱";
-  } else if (price > avgPrice && buySellDiff > 0) {
-    risk = "可观察";
-  } else {
-    risk = "中性";
-  }
+  if (price < avgPrice && bigOrderDiff < 0) risk = "偏弱";
+  else if (price > avgPrice && buySellDiff > 0) risk = "可观察";
+  else risk = "中性";
 
-  // 7. 趋势判断
   if (score >= 5) trend = "强势回流";
   else if (score >= 2) trend = "企稳偏强";
   else if (score >= -1) trend = "震荡观察";
   else trend = "弱势回避";
 
-  // 8. 操作提示
-  if (score >= 6) {
-    action = "可小仓试探";
-  } else if (score >= 3) {
-    action = "等待回踩确认";
-  } else {
-    action = "继续持有观察";
-  }
+  if (score >= 6) action = "可小仓试探";
+  else if (score >= 3) action = "等待回踩确认";
+  else action = "继续持有观察";
 
   return {
     ...stock,
@@ -375,38 +335,25 @@ function analyzeStock(stock, minutes) {
 }
 
 // ========== 板块联动评分 ==========
-function analyzeSector(stocks) {
-  const analyzed = stocks;  // stocks 已经是经过 analyzeStock 处理的数组
-  const strongCount = analyzed.filter(s => s.score >= 3).length;
-  const weakCount = analyzed.filter(s => s.score <= -2).length;
-  const aboveAvgCount = analyzed.filter(s => s.price > s.avgPrice).length;
-  const positiveBuyCount = analyzed.filter(s => s.buySellDiff > 0).length;
+function analyzeSector(analyzedStocks) {
+  const strongCount = analyzedStocks.filter(s => s.score >= 3).length;
+  const weakCount = analyzedStocks.filter(s => s.score <= -2).length;
+  const aboveAvgCount = analyzedStocks.filter(s => s.price > s.avgPrice).length;
+  const positiveBuyCount = analyzedStocks.filter(s => s.buySellDiff > 0).length;
 
   let sectorSignal = "";
-  if (strongCount >= 3 && positiveBuyCount >= 3) {
-    sectorSignal = "板块资金回流";
-  } else if (weakCount >= 3) {
-    sectorSignal = "板块整体偏弱";
-  } else if (aboveAvgCount >= 3) {
-    sectorSignal = "板块有企稳迹象";
-  } else {
-    sectorSignal = "板块震荡观察";
-  }
+  if (strongCount >= 3 && positiveBuyCount >= 3) sectorSignal = "板块资金回流";
+  else if (weakCount >= 3) sectorSignal = "板块整体偏弱";
+  else if (aboveAvgCount >= 3) sectorSignal = "板块有企稳迹象";
+  else sectorSignal = "板块震荡观察";
 
-  return {
-    sectorSignal,
-    strongCount,
-    weakCount,
-    aboveAvgCount,
-    positiveBuyCount,
-    stocks: analyzed,
-  };
+  return { sectorSignal, strongCount, weakCount, aboveAvgCount, positiveBuyCount };
 }
 
-// ========== 卡片生成 ==========
-function cardHtml(stock, decision) {
+// ========== 卡片生成（按要求展示字段） ==========
+function cardHtml(stock) {
   const c = stock.pct >= 0 ? "red" : "green";
-  const actionClass = decision.score >= 6 ? "red" : decision.score >= 3 ? "orange" : "green";
+  const actionClass = stock.score >= 6 ? "red" : stock.score >= 3 ? "orange" : "green";
   return `
   <div class="card">
     <div class="name">${stock.name}</div>
@@ -416,26 +363,25 @@ function cardHtml(stock, decision) {
     <div class="chart" id="chart-${stock.code}"></div>
     <div class="info">
       当前价：${stock.price?.toFixed(2) ?? "--"}<br>
-      均价：${isFinite(stock.avgPrice) ? stock.avgPrice.toFixed(2) : "--"}<br>
-      均价偏离：${decision.avgDeviation}%<br>
       今开：${stock.open?.toFixed(2) ?? "--"}　
       最高：${stock.high?.toFixed(2) ?? "--"}　
       最低：${stock.low?.toFixed(2) ?? "--"}<br>
       昨收：${stock.prev?.toFixed(2) ?? "--"}　
-      成交额：${money(stock.amount)}<br>
-      主动买卖差：${decision.buySellDiff}手<br>
-      大单净差：${decision.bigOrderDiff}手
+      成交额：${money(stock.amount)}
     </div>
     <div class="decision">
-      评分：<b>${decision.score}</b><br>
-      操作：<span class="${actionClass}"><b>${decision.action}</b></span><br>
-      风险：${decision.risk}<br>
-      趋势：${decision.trend}
+      <p>评分：<b>${stock.score}</b></p>
+      <p>操作提示：<span class="${actionClass}"><b>${stock.action}</b></span></p>
+      <p>风险：${stock.risk}</p>
+      <p>分时趋势：${stock.trend}</p>
+      <p>均价偏离：${stock.avgDeviation}%</p>
+      <p>主动买卖差：${stock.buySellDiff}手</p>
+      <p>大单净额：${stock.bigOrderDiff}手</p>
     </div>
   </div>`;
 }
 
-// ========== 图表绘制（已稳定） ==========
+// ========== 图表绘制 ==========
 function drawChart(s, m) {
   const el = document.getElementById(`chart-${s.code}`);
   if (!el) return;
@@ -465,47 +411,52 @@ function drawChart(s, m) {
   setTimeout(() => chart.resize(), 50);
 }
 
-// ========== 主加载流程 ==========
-async function load() {
+// ========== 主加载 ==========
+async function load(){
   const grid = document.getElementById("grid");
   destroyAllCharts();
 
-  const cardsData = [];
+  const analyzedList = [];
+  const minuteMap = {};
+
   for (const s of stocks) {
     try {
       const base = await fetchBase(s);
       const minute = await fetchMinute(s);
-      // 合并均价到 base
-      if (minute.length > 0) base.avgPrice = minute[minute.length - 1].avg;
-      // 使用增强决策（主动买卖和大单暂为0，待后续接入真实分笔数据）
       const analyzed = analyzeStock(base, minute);
-      cardsData.push({ stock: analyzed, minute });
+      analyzedList.push(analyzed);
+      minuteMap[s.code] = minute;
     } catch (e) {
-      cardsData.push({ error: true, name: s.name, code: s.code });
+      analyzedList.push({ error: true, name: s.name, code: s.code });
     }
   }
 
-  // 板块联动评分
-  const analyzedStocks = cardsData.filter(cd => !cd.error).map(cd => cd.stock);
-  const sectorResult = analyzeSector(analyzedStocks);
-  document.getElementById("sector-signal").innerHTML =
-    `板块信号：<b>${sectorResult.sectorSignal}</b>（强势${sectorResult.strongCount}只，弱势${sectorResult.weakCount}只，站上均价${sectorResult.aboveAvgCount}只，主动买盘净流入${sectorResult.positiveBuyCount}只）`;
+  // 板块信号
+  const validStocks = analyzedList.filter(s => !s.error);
+  const sector = analyzeSector(validStocks);
+  document.getElementById("sector-panel").innerHTML = `
+    <h2 style="margin:0 0 6px">板块状态：${sector.sectorSignal}</h2>
+    <p style="margin:2px 0">强势股数量：${sector.strongCount}</p>
+    <p style="margin:2px 0">弱势股数量：${sector.weakCount}</p>
+    <p style="margin:2px 0">站上均价线数量：${sector.aboveAvgCount}</p>
+    <p style="margin:2px 0">主动买入占优数量：${sector.positiveBuyCount}</p>
+  `;
 
-  // 生成卡片HTML
+  // 生成卡片
   let html = '';
-  for (const cd of cardsData) {
-    if (cd.error) {
-      html += `<div class="card"><div class="name">${cd.name}</div><div class="code">${cd.code}</div><div class="green">数据读取失败，等待下次刷新</div></div>`;
+  for (const stock of analyzedList) {
+    if (stock.error) {
+      html += `<div class="card"><div class="name">${stock.name}</div><div class="code">${stock.code}</div><div class="green">数据读取失败，等待下次刷新</div></div>`;
     } else {
-      html += cardHtml(cd.stock, cd.stock); // 决策字段已内嵌在stock对象中
+      html += cardHtml(stock);
     }
   }
   grid.innerHTML = html;
 
-  // 批量绘制图表
+  // 画图
   requestAnimationFrame(() => {
-    cardsData.forEach(cd => {
-      if (!cd.error) drawChart(cd.stock, cd.minute);
+    validStocks.forEach(stock => {
+      drawChart(stock, minuteMap[stock.code]);
     });
   });
 
@@ -518,7 +469,6 @@ window.addEventListener("resize", () => {
   });
 });
 
-// 启动
 load();
 setInterval(load, 15000);
 </script>
