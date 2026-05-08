@@ -1,7 +1,8 @@
-from flask import Flask, jsonify, render_template_string
+from flask import Flask, jsonify, render_template_string, request
 import requests
 import time
 import statistics
+import traceback
 
 app = Flask(__name__)
 
@@ -16,11 +17,12 @@ STOCKS = [
 
 
 def safe_float(x, div=1):
+    """安全转换为浮点数，可指定除数"""
     try:
         if x is None or x == "-":
             return None
         return round(float(x) / div, 2)
-    except Exception:
+    except (ValueError, TypeError):
         return None
 
 
@@ -34,20 +36,26 @@ def fetch_quote(secid):
     r = requests.get(url, params=params, timeout=6)
     data = r.json().get("data") or {}
 
+    # 昨收单独取，用于价格为空时的保底
+    pre_close = safe_float(data.get("f60"), 100)
+    price = safe_float(data.get("f43"), 100)
+    if price is None:
+        price = pre_close  # 非交易时段显示昨收
+
     return {
-        "price": safe_float(data.get("f43"), 100),
+        "price": price,
         "high": safe_float(data.get("f44"), 100),
         "low": safe_float(data.get("f45"), 100),
         "open": safe_float(data.get("f46"), 100),
-        "volume": safe_float(data.get("f47"), 100),
-        "amount": safe_float(data.get("f48"), 100000000),
-        "pre_close": safe_float(data.get("f60"), 100),
-        "pct": safe_float(data.get("f170"), 100),
-        "turnover": safe_float(data.get("f168"), 100),
-        "market_cap": safe_float(data.get("f116"), 100000000),
-        "float_cap": safe_float(data.get("f117"), 100000000),
-        "outer": safe_float(data.get("f49"), 1),
-        "inner": safe_float(data.get("f161"), 1),
+        "volume": safe_float(data.get("f47")),          # 手，不除以100
+        "amount": safe_float(data.get("f48"), 100000000), # 元转亿
+        "pre_close": pre_close,
+        "pct": safe_float(data.get("f170"), 100),        # 涨跌幅，已带%
+        "turnover": safe_float(data.get("f168"), 100),   # 换手率，%
+        "market_cap": safe_float(data.get("f116"), 100000000), # 总市值，元转亿
+        "float_cap": safe_float(data.get("f117"), 100000000),  # 流通市值
+        "outer": safe_float(data.get("f49")),            # 外盘
+        "inner": safe_float(data.get("f161")),           # 内盘
     }
 
 
@@ -69,8 +77,10 @@ def fetch_trend(secid):
     for item in trends:
         p = item.split(",")
         if len(p) >= 8:
+            # 时间格式 2026-05-08 09:30:00 -> 取后5位 "09:30"
+            time_str = p[0][-5:] if p[0] and len(p[0]) >= 5 else ""
             rows.append({
-                "time": p[0][-5:],
+                "time": time_str,
                 "price": safe_float(p[1]),
                 "avg": safe_float(p[2]),
                 "volume": safe_float(p[5]),
@@ -82,13 +92,20 @@ def fetch_trend(secid):
 def analyze(stock, quote, trend):
     price = quote.get("price")
     pct = quote.get("pct")
-    avg = trend[-1]["avg"] if trend else None
+    avg = None
+    if trend:
+        # 有可能最后几个元素的avg为None，取最后一个有效值
+        for point in reversed(trend):
+            if point.get("avg") is not None:
+                avg = point["avg"]
+                break
 
-    prices = [x["price"] for x in trend if x.get("price")]
+    prices = [x["price"] for x in trend if x.get("price") is not None]
     score = 0
     reasons = []
 
-    if price and avg:
+    # 均线判断
+    if price is not None and avg is not None:
         if price > avg:
             score += 2
             reasons.append("站上均线")
@@ -96,6 +113,7 @@ def analyze(stock, quote, trend):
             score -= 2
             reasons.append("低于均线")
 
+    # 涨跌幅判断
     if pct is not None:
         if pct > 1:
             score += 2
@@ -107,6 +125,7 @@ def analyze(stock, quote, trend):
             score -= 1
             reasons.append("弱势震荡")
 
+    # 短线趋势判断（至少需要20个有效价格点）
     if len(prices) >= 20:
         recent = prices[-10:]
         earlier = prices[-30:-20] if len(prices) >= 30 else prices[:10]
@@ -117,6 +136,7 @@ def analyze(stock, quote, trend):
             score -= 2
             reasons.append("短线走弱")
 
+    # 内外盘判断
     outer = quote.get("outer") or 0
     inner = quote.get("inner") or 0
     if outer > inner * 1.2 and outer > 0:
@@ -156,25 +176,32 @@ def api_data():
             trend = fetch_trend(s["secid"])
             decision = analyze(s, quote, trend)
             result.append({
-                **s,
+                "name": s["name"],
+                "code": s["code"],
+                "secid": s["secid"],
                 "quote": quote,
                 "trend": trend,
                 "decision": decision,
             })
         except Exception as e:
             result.append({
-                **s,
+                "name": s["name"],
+                "code": s["code"],
+                "secid": s["secid"],
                 "error": str(e),
                 "quote": {},
                 "trend": [],
                 "decision": {"score": 0, "action": "数据异常", "risk": "未知", "reasons": []},
             })
 
+    # 板块统计
     strong = sum(1 for x in result if x["decision"]["score"] >= 5)
     weak = sum(1 for x in result if x["decision"]["score"] <= -2)
     above_avg = sum(
         1 for x in result
-        if x["quote"].get("price") and x["trend"] and x["quote"].get("price") > x["trend"][-1].get("avg", 999999)
+        if x["quote"].get("price") is not None
+        and x["trend"]
+        and (x["quote"]["price"] > (x["trend"][-1].get("avg") or 0))
     )
 
     if strong >= 3 and above_avg >= 3:
@@ -278,7 +305,8 @@ async function loadData(){
         <div>评分：<span class="big">${d.score}</span></div>
         <div>操作提示：<span class="tag ${tagClass}">${d.action}</span></div>
         <div>风险：${d.risk}</div>
-        <div>判断依据：${(d.reasons || []).join(' / ')}</div>
+        <div>判断依据：${(d.reasons || []).join(' / ') || '暂无'}</div>
+        ${s.error ? `<div style="color:red;margin-top:4px;">异常：${s.error}</div>` : ''}
       </div>
     `;
     grid.appendChild(div);
@@ -309,6 +337,7 @@ setInterval(loadData, 15000);
 </body>
 </html>
 """
+
 
 @app.route("/")
 def index():
