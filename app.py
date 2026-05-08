@@ -2,8 +2,8 @@ from flask import Flask, jsonify, render_template_string
 import requests
 import time
 import statistics
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
+import concurrent.futures
+import os
 
 app = Flask(__name__)
 
@@ -16,19 +16,24 @@ STOCKS = [
     {"name": "豪威集团", "code": "603501", "secid": "1.603501"},
 ]
 
-# 全局 session 复用连接
+CACHE = {"time": 0, "data": None}
+CACHE_SECONDS = 8
+
 session = requests.Session()
-retries = Retry(total=2, backoff_factor=0.5, status_forcelist=[500, 502, 503, 504])
-session.mount('https://', HTTPAdapter(max_retries=retries, pool_connections=10, pool_maxsize=20))
-session.mount('http://', HTTPAdapter(max_retries=retries, pool_connections=10, pool_maxsize=20))
+session.headers.update({
+    "User-Agent": "Mozilla/5.0",
+    "Referer": "https://quote.eastmoney.com/"
+})
+
 
 def safe_float(x, div=1):
     try:
         if x is None or x == "-":
             return None
         return round(float(x) / div, 2)
-    except (ValueError, TypeError):
+    except:
         return None
+
 
 def fetch_quote(secid):
     url = "https://push2.eastmoney.com/api/qt/stock/get"
@@ -37,21 +42,11 @@ def fetch_quote(secid):
         "fields": "f43,f44,f45,f46,f47,f48,f60,f170,f168,f116,f117,f49,f161",
         "_": int(time.time() * 1000),
     }
-    try:
-        r = session.get(url, params=params, timeout=(3.05, 10))
-        data = r.json().get("data") or {}
-    except Exception:
-        time.sleep(1)
-        try:
-            r = session.get(url, params=params, timeout=(3.05, 10))
-            data = r.json().get("data") or {}
-        except Exception:
-            return {}
+    r = session.get(url, params=params, timeout=3)
+    data = r.json().get("data") or {}
 
     pre_close = safe_float(data.get("f60"), 100)
-    price = safe_float(data.get("f43"), 100)
-    if price is None:
-        price = pre_close
+    price = safe_float(data.get("f43"), 100) or pre_close
 
     return {
         "price": price,
@@ -68,54 +63,45 @@ def fetch_quote(secid):
         "inner": safe_float(data.get("f161")),
     }
 
+
 def fetch_trend(secid):
     url = "https://push2his.eastmoney.com/api/qt/stock/trends2/get"
     params = {
         "secid": secid,
         "fields1": "f1,f2,f3,f4,f5,f6,f7,f8",
         "fields2": "f51,f52,f53,f54,f55,f56,f57,f58",
-        "iscr": "0", "iscca": "0", "ndays": "1",
+        "iscr": "0",
+        "iscca": "0",
+        "ndays": "1",
         "_": int(time.time() * 1000),
     }
-    try:
-        r = session.get(url, params=params, timeout=(3.05, 10))
-        trends = (r.json().get("data") or {}).get("trends") or []
-    except Exception:
-        time.sleep(1)
-        try:
-            r = session.get(url, params=params, timeout=(3.05, 10))
-            trends = (r.json().get("data") or {}).get("trends") or []
-        except Exception:
-            return []
+    r = session.get(url, params=params, timeout=3)
+    trends = (r.json().get("data") or {}).get("trends") or []
 
     rows = []
     for item in trends:
         p = item.split(",")
         if len(p) >= 8:
-            time_str = p[0][-5:] if p[0] and len(p[0]) >= 5 else ""
             rows.append({
-                "time": time_str,
+                "time": p[0][-5:],
                 "price": safe_float(p[1]),
                 "avg": safe_float(p[2]),
                 "volume": safe_float(p[5]),
             })
     return rows
 
+
 def analyze(quote, trend):
     price = quote.get("price")
     pct = quote.get("pct")
-    avg = None
-    if trend:
-        for point in reversed(trend):
-            if point.get("avg") is not None:
-                avg = point["avg"]
-                break
+    avg = trend[-1]["avg"] if trend and trend[-1].get("avg") else None
 
     prices = [x["price"] for x in trend if x.get("price") is not None]
+
     score = 0
     reasons = []
 
-    if price is not None and avg is not None:
+    if price and avg:
         if price > avg:
             score += 2
             reasons.append("站上均线")
@@ -135,9 +121,9 @@ def analyze(quote, trend):
             reasons.append("弱势震荡")
 
     if len(prices) >= 20:
-        recent = prices[-10:]
-        earlier = prices[-30:-20] if len(prices) >= 30 else prices[:10]
-        if statistics.mean(recent) > statistics.mean(earlier):
+        recent = statistics.mean(prices[-10:])
+        earlier = statistics.mean(prices[-30:-20]) if len(prices) >= 30 else statistics.mean(prices[:10])
+        if recent > earlier:
             score += 2
             reasons.append("短线回升")
         else:
@@ -146,6 +132,7 @@ def analyze(quote, trend):
 
     outer = quote.get("outer") or 0
     inner = quote.get("inner") or 0
+
     if outer > inner * 1.2 and outer > 0:
         score += 2
         reasons.append("主动买强")
@@ -166,49 +153,88 @@ def analyze(quote, trend):
         action = "观望"
         risk = "中性"
 
-    return {"score": score, "action": action, "risk": risk, "reasons": reasons}
+    return {
+        "score": score,
+        "action": action,
+        "risk": risk,
+        "reasons": reasons or ["数据不足"],
+    }
 
-@app.route("/api/data")
-def api_data():
-    result = []
-    for s in STOCKS:
-        try:
-            quote = fetch_quote(s["secid"])
-            trend = fetch_trend(s["secid"])
-            decision = analyze(quote, trend)
-            result.append({
-                "name": s["name"],
-                "code": s["code"],
-                "quote": quote,
-                "trend": trend,
-                "decision": decision,
-            })
-        except Exception as e:
-            result.append({
-                "name": s["name"],
-                "code": s["code"],
-                "error": str(e),
-                "quote": {},
-                "trend": [],
-                "decision": {"score": 0, "action": "数据异常", "risk": "未知", "reasons": []},
-            })
+
+def fetch_one_stock(s):
+    try:
+        quote = fetch_quote(s["secid"])
+        trend = fetch_trend(s["secid"])
+        decision = analyze(quote, trend)
+        return {
+            "name": s["name"],
+            "code": s["code"],
+            "quote": quote,
+            "trend": trend,
+            "decision": decision,
+            "error": "",
+        }
+    except Exception as e:
+        return {
+            "name": s["name"],
+            "code": s["code"],
+            "quote": {},
+            "trend": [],
+            "decision": {
+                "score": 0,
+                "action": "数据暂时异常",
+                "risk": "未知",
+                "reasons": ["接口超时或数据源无响应"],
+            },
+            "error": str(e),
+        }
+
+
+def build_data():
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
+        result = list(executor.map(fetch_one_stock, STOCKS))
 
     strong = sum(1 for x in result if x["decision"]["score"] >= 5)
     weak = sum(1 for x in result if x["decision"]["score"] <= -2)
-    above_avg = sum(1 for x in result if x["quote"].get("price") and x["trend"] and x["quote"]["price"] > (x["trend"][-1].get("avg") or 0))
+    above_avg = sum(
+        1 for x in result
+        if x["quote"].get("price")
+        and x["trend"]
+        and x["trend"][-1].get("avg")
+        and x["quote"]["price"] > x["trend"][-1]["avg"]
+    )
 
     if strong >= 3 and above_avg >= 3:
-        sector = "板块有修复，可以重点观察"
+        sector_status = "板块有修复，可以重点观察"
     elif weak >= 4:
-        sector = "板块整体偏弱"
+        sector_status = "板块整体偏弱"
     else:
-        sector = "板块震荡，等待确认"
+        sector_status = "板块震荡，等待确认"
 
-    return jsonify({
+    return {
         "time": time.strftime("%H:%M:%S"),
-        "sector": {"status": sector, "strong": strong, "weak": weak, "above_avg": above_avg},
+        "sector": {
+            "status": sector_status,
+            "strong": strong,
+            "weak": weak,
+            "above_avg": above_avg,
+        },
         "stocks": result,
-    })
+    }
+
+
+@app.route("/api/data")
+def api_data():
+    now = time.time()
+
+    if CACHE["data"] and now - CACHE["time"] < CACHE_SECONDS:
+        return jsonify(CACHE["data"])
+
+    data = build_data()
+    CACHE["time"] = now
+    CACHE["data"] = data
+    return jsonify(data)
+
 
 HTML = """
 <!DOCTYPE html>
@@ -234,125 +260,137 @@ body{font-family:Arial,"Microsoft YaHei";background:#f3f4f6;margin:0;color:#1118
 .buy{background:#dcfce7;color:#166534}
 .wait{background:#fef9c3;color:#854d0e}
 .no{background:#fee2e2;color:#991b1b}
-.error-msg{color:red;margin-top:8px;font-size:13px}
+.err{color:#dc2626;font-size:13px}
 @media(max-width:1000px){.grid{grid-template-columns:1fr}}
 </style>
 </head>
 <body>
+
 <div class="header">
   <h1>板块状态：<span id="sector">加载中...</span></h1>
   <p>刷新时间：<span id="time">--</span></p>
   <p>强势股数量：<span id="strong">--</span></p>
   <p>弱势股数量：<span id="weak">--</span></p>
   <p>站上均线数量：<span id="above">--</span></p>
-  <p id="global-error" class="error-msg"></p>
+  <p class="err" id="err"></p>
 </div>
-<div class="grid" id="grid"></div>
-<script>
-// 全局错误显示
-function showGlobalError(msg) {
-    const el = document.getElementById('global-error');
-    if (el) el.innerText = msg || '';
-}
 
-async function fetchWithRetry(url, retries = 2, delay = 2000) {
-    for (let i = 0; i <= retries; i++) {
-        try {
-            const res = await fetch(url);
-            if (!res.ok) throw new Error('HTTP ' + res.status);
-            return await res.json();
-        } catch (err) {
-            if (i === retries) throw err;
-            console.warn(`请求失败，${delay/1000}秒后重试... (${i+1}/${retries})`);
-            await new Promise(r => setTimeout(r, delay));
-        }
-    }
+<div class="grid" id="grid"></div>
+
+<script>
+let charts = [];
+
+function renderChart(id, trend){
+  const dom = document.getElementById(id);
+  if(!dom) return;
+
+  const chart = echarts.init(dom);
+  charts.push(chart);
+
+  const times = trend.map(x => x.time);
+  const prices = trend.map(x => x.price);
+  const avgs = trend.map(x => x.avg);
+
+  chart.setOption({
+    animation:false,
+    grid:{left:35,right:10,top:10,bottom:25},
+    xAxis:{type:'category',data:times,axisLabel:{show:false}},
+    yAxis:{type:'value',scale:true,axisLabel:{fontSize:10}},
+    tooltip:{trigger:'axis'},
+    series:[
+      {name:'价格',type:'line',data:prices,smooth:true,symbol:'none',lineStyle:{width:2}},
+      {name:'均价',type:'line',data:avgs,smooth:true,symbol:'none',lineStyle:{width:1,type:'dashed'}}
+    ]
+  });
 }
 
 async function loadData(){
-    showGlobalError('');
-    try {
-        const data = await fetchWithRetry('/api/data?t=' + Date.now());
-        if (!data || !data.stocks) throw new Error('返回数据为空');
+  const err = document.getElementById('err');
+  err.innerText = '';
 
-        document.getElementById('sector').innerText = data.sector.status;
-        document.getElementById('time').innerText = data.time;
-        document.getElementById('strong').innerText = data.sector.strong;
-        document.getElementById('weak').innerText = data.sector.weak;
-        document.getElementById('above').innerText = data.sector.above_avg;
+  try{
+    const res = await fetch('/api/data?t=' + Date.now());
+    if(!res.ok) throw new Error('HTTP ' + res.status);
 
-        const grid = document.getElementById('grid');
-        grid.innerHTML = '';
+    const data = await res.json();
 
-        data.stocks.forEach((s, i) => {
-            const q = s.quote || {};
-            const d = s.decision || {};
-            const pct = q.pct ?? 0;
-            const colorClass = pct >= 0 ? 'red' : 'green';
-            let tagClass = 'wait';
-            if(d.score >= 5) tagClass = 'buy';
-            else if(d.score <= -4) tagClass = 'no';
+    document.getElementById('sector').innerText = data.sector.status;
+    document.getElementById('time').innerText = data.time;
+    document.getElementById('strong').innerText = data.sector.strong;
+    document.getElementById('weak').innerText = data.sector.weak;
+    document.getElementById('above').innerText = data.sector.above_avg;
 
-            const div = document.createElement('div');
-            div.className = 'card';
-            div.innerHTML = `
-                <div class="name">${s.name}</div>
-                <div class="code">${s.code}</div>
-                <div class="price ${colorClass}">${q.price ?? '--'}</div>
-                <div class="${colorClass}">涨幅：${q.pct ?? '--'}%</div>
-                <div id="chart${i}" class="chart"></div>
-                <div class="info">
-                    今开：${q.open ?? '--'}　最高：${q.high ?? '--'}　最低：${q.low ?? '--'}<br>
-                    昨收：${q.pre_close ?? '--'}　成交额：${q.amount ?? '--'}亿<br>
-                    换手：${q.turnover ?? '--'}%　流通市值：${q.float_cap ?? '--'}亿
-                </div>
-                <div class="decision">
-                    <div>评分：<span class="big">${d.score}</span></div>
-                    <div>操作提示：<span class="tag ${tagClass}">${d.action}</span></div>
-                    <div>风险：${d.risk}</div>
-                    <div>判断依据：${(d.reasons || []).join(' / ') || '暂无'}</div>
-                    ${s.error ? `<div style="color:red;margin-top:4px;">异常：${s.error}</div>` : ''}
-                </div>
-            `;
-            grid.appendChild(div);
+    charts.forEach(c => c.dispose());
+    charts = [];
 
-            // 确保图表容器已渲染再初始化
-            setTimeout(() => {
-                const chartDom = document.getElementById('chart'+i);
-                if (!chartDom) return;
-                const chart = echarts.init(chartDom);
-                const times = (s.trend || []).map(x => x.time);
-                const prices = (s.trend || []).map(x => x.price);
-                const avgs = (s.trend || []).map(x => x.avg);
-                chart.setOption({
-                    animation: false,
-                    grid: { left: 35, right: 10, top: 10, bottom: 25 },
-                    xAxis: { type: 'category', data: times, axisLabel: { show: false } },
-                    yAxis: { type: 'value', scale: true, axisLabel: { fontSize: 10 } },
-                    series: [
-                        { name: '价格', type: 'line', data: prices, smooth: true, symbol: 'none', lineStyle: { width: 2 } },
-                        { name: '均价', type: 'line', data: avgs, smooth: true, symbol: 'none', lineStyle: { width: 1, type: 'dashed' } }
-                    ],
-                    tooltip: { trigger: 'axis' }
-                });
-            }, 100);
-        });
-    } catch (err) {
-        console.error('数据加载失败:', err);
-        showGlobalError('数据加载失败：' + err.message + '，15秒后自动重试...');
-    }
+    const grid = document.getElementById('grid');
+    grid.innerHTML = '';
+
+    data.stocks.forEach((s, i) => {
+      const q = s.quote || {};
+      const d = s.decision || {};
+      const pct = q.pct ?? 0;
+      const colorClass = pct >= 0 ? 'red' : 'green';
+
+      let tagClass = 'wait';
+      if(d.score >= 5) tagClass = 'buy';
+      if(d.score <= -4) tagClass = 'no';
+
+      const card = document.createElement('div');
+      card.className = 'card';
+      card.innerHTML = `
+        <div class="name">${s.name}</div>
+        <div class="code">${s.code}</div>
+        <div class="price ${colorClass}">${q.price ?? '--'}</div>
+        <div class="${colorClass}">涨幅：${q.pct ?? '--'}%</div>
+        <div id="chart${i}" class="chart"></div>
+
+        <div class="info">
+          今开：${q.open ?? '--'}　最高：${q.high ?? '--'}　最低：${q.low ?? '--'}<br>
+          昨收：${q.pre_close ?? '--'}　成交额：${q.amount ?? '--'}亿<br>
+          换手：${q.turnover ?? '--'}%　流通市值：${q.float_cap ?? '--'}亿<br>
+          主动买：${q.outer ?? '--'}　主动卖：${q.inner ?? '--'}
+        </div>
+
+        <div class="decision">
+          <div>评分：<span class="big">${d.score}</span></div>
+          <div>操作提示：<span class="tag ${tagClass}">${d.action}</span></div>
+          <div>风险：${d.risk}</div>
+          <div>判断依据：${(d.reasons || []).join(' / ')}</div>
+          ${s.error ? `<div class="err">异常：${s.error}</div>` : ''}
+        </div>
+      `;
+      grid.appendChild(card);
+    });
+
+    setTimeout(() => {
+      data.stocks.forEach((s, i) => renderChart('chart' + i, s.trend || []));
+    }, 100);
+
+  }catch(e){
+    err.innerText = '数据加载失败：' + e.message + '。请等待自动刷新。';
+  }
 }
 
 loadData();
 setInterval(loadData, 15000);
 </script>
+
 </body>
 </html>
 """
+
 
 @app.route("/")
 def index():
     return render_template_string(HTML)
 
+
+@app.route("/health")
+def health():
+    return "ok"
+
+
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
