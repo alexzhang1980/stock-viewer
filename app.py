@@ -1,7 +1,8 @@
-import os, requests, json, re
+import os
+import requests
 from flask import Flask, jsonify, render_template_string, request
-from datetime import datetime
 import pandas as pd
+from datetime import datetime
 import akshare as ak
 
 app = Flask(__name__)
@@ -17,31 +18,35 @@ def code_to_eastmoney_secid(code):
         market = '1' if code.startswith('6') else '0'
         return f"{market}.{code}"
 
-STOCK_LIST = ['sh688981','sz002371','sh603501','sh688041','sh688256','sh603986']
+# ---------- 目标股池 ----------
+STOCK_LIST = ['sh688981', 'sz002371', 'sh603501', 'sh688041', 'sh688256', 'sh603986']
 
 # ---------- 批量实时行情 ----------
 @app.route('/api/batch_quote')
 def batch_quote():
-    codes = request.args.get('codes','sh688981,sz002371').split(',')
+    codes = request.args.get('codes', ','.join(STOCK_LIST)).split(',')
     result = {}
     for code in codes:
         secid = code_to_eastmoney_secid(code)
         try:
             url = "https://push2.eastmoney.com/api/qt/stock/get"
-            params = {'secid': secid,
-                      'fields': 'f43,f44,f45,f46,f47,f48,f50,f57,f58,f60,f169,f170',
-                      'invt': '2', 'fltt': '2'}
+            params = {
+                'secid': secid,
+                'fields': 'f43,f44,f45,f46,f47,f48,f50,f57,f58,f60,f169,f170',
+                'invt': '2',
+                'fltt': '2'
+            }
             h = {'Referer': 'https://quote.eastmoney.com/'}
             r = requests.get(url, params=params, headers=h, timeout=5)
             d = r.json().get('data', {})
             if d:
                 result[code] = {
-                    "name": d.get('f58',''),
-                    "price": d.get('f43',0)/100 if d.get('f43') else 0,
-                    "last_close": d.get('f60',0)/100 if d.get('f60') else 0,
-                    "volume": d.get('f47',0),
-                    "amount": d.get('f48',0),
-                    "volume_ratio": d.get('f50',0)/100 if d.get('f50') else 0,
+                    "name": d.get('f58', ''),
+                    "price": d.get('f43', 0) / 100 if d.get('f43') else 0,
+                    "last_close": d.get('f60', 0) / 100 if d.get('f60') else 0,
+                    "volume": d.get('f47', 0),
+                    "amount": d.get('f48', 0),
+                    "volume_ratio": d.get('f50', 0) / 100 if d.get('f50') else 0,
                 }
             else:
                 result[code] = {"error": "no data"}
@@ -49,116 +54,53 @@ def batch_quote():
             result[code] = {"error": str(e)}
     return jsonify(result)
 
-# ---------- 五档盘口 ----------
+# ---------- 全量盘口信息 ----------
 @app.route('/api/quote/<code>')
 def quote_detail(code):
     secid = code_to_eastmoney_secid(code)
-    fields = ','.join([f'f{43+i}' for i in range(60)])  # 足够的字段
     try:
         url = "https://push2.eastmoney.com/api/qt/stock/get"
-        params = {'secid': secid, 'fields': 'f58,f43,f44,f45,f46,f47,f48,f50,f60,' + fields, 'invt': '2','fltt': '2'}
+        # 聚合常用字段 + 五档盘口 (买一至买五/卖一至卖五)
+        fields = ('f43,f44,f45,f46,f47,f48,f50,f57,f58,f60,f169,f170,'
+                  'f19,f20,f21,f22,f23,f24,f25,f26,f27,f28,f29,f30,f31,f32,f33,f34,f35,f36,f37')
+        params = {'secid': secid, 'fields': fields, 'invt': '2', 'fltt': '2'}
         h = {'Referer': 'https://quote.eastmoney.com/'}
         r = requests.get(url, params=params, headers=h, timeout=5)
-        d = r.json().get('data',{})
-        if not d: return jsonify({"error":"no data"}),404
-        # 解析五档
-        buy = []
-        sell = []
-        for i in range(1,6):
-            bp = d.get(f'f{18+2*i}', 0)/1e4 if d.get(f'f{18+2*i}') else 0
-            bs = d.get(f'f{17+2*i}', 0) if d.get(f'f{17+2*i}') else 0
-            sp = d.get(f'f{18+2*i+10}', 0)/1e4 if d.get(f'f{18+2*i+10}') else 0
-            ss = d.get(f'f{17+2*i+10}', 0) if d.get(f'f{17+2*i+10}') else 0
-            buy.append({'price': bp, 'volume': bs})
-            sell.append({'price': sp, 'volume': ss})
+        d = r.json().get('data', {})
+        if not d:
+            return jsonify({"error": "no data"}), 404
+
+        # 辅助解析价格(÷100) / 成交量(手)
+        def p(field): return d.get(field, 0) / 100 if d.get(field) else 0
+        def vol(field): return int(d.get(field, 0) or 0)
+
+        buy5 = [
+            {"price": p('f19'), "volume": vol('f20')},
+            {"price": p('f21'), "volume": vol('f22')},
+            {"price": p('f23'), "volume": vol('f24')},
+            {"price": p('f25'), "volume": vol('f26')},
+            {"price": p('f27'), "volume": vol('f28')},
+        ]
+        sell5 = [
+            {"price": p('f29'), "volume": vol('f30')},
+            {"price": p('f31'), "volume": vol('f32')},
+            {"price": p('f33'), "volume": vol('f34')},
+            {"price": p('f35'), "volume": vol('f36')},
+            {"price": p('f37'), "volume": vol('f38')},
+        ]
+
         return jsonify({
-            "name": d.get('f58',''),
-            "price": d.get('f43',0)/100,
-            "last_close": d.get('f60',0)/100,
-            "volume": d.get('f47',0),
-            "volume_ratio": d.get('f50',0)/100,
-            "buy5": buy,
-            "sell5": sell
+            "name": d.get('f58', ''),
+            "price": d.get('f43', 0) / 100 if d.get('f43') else 0,
+            "last_close": d.get('f60', 0) / 100 if d.get('f60') else 0,
+            "volume": d.get('f47', 0),
+            "amount": d.get('f48', 0),
+            "volume_ratio": d.get('f50', 0) / 100 if d.get('f50') else 0,
+            "buy5": buy5,
+            "sell5": sell5
         })
     except Exception as e:
-        return jsonify({"error": str(e)}),500
-
-# ---------- 分时成交明细（带超大单标记）----------
-@app.route('/api/tick_data/<code>')
-def tick_data(code):
-    symbol = code.replace('.','').replace('SZ','sz').replace('SH','sh')
-    try:
-        df = ak.stock_zh_a_tick_tx_js(symbol=symbol)
-        if df is None or df.empty:
-            return jsonify({"error":"no data"}),404
-        tick_list = []
-        prev_direction = None
-        consecutive_count = 0
-        for _, row in df.iterrows():
-            t = str(row.get('成交时间',''))
-            price = float(row.get('成交价格',0))
-            vol = int(row.get('成交量',0))
-            nature = row.get('性质','')
-            direction = 'B' if '买' in str(nature) else 'S'
-            is_big = vol >= 500   # 超大单阈值500手，可调
-            # 连续单判断
-            if direction == prev_direction:
-                consecutive_count += 1
-            else:
-                consecutive_count = 1
-                prev_direction = direction
-            consecutive = (consecutive_count >= 3)
-            tick_list.append({
-                '时间': t,
-                '价格': price,
-                '成交': vol,
-                '方向': direction,
-                '超大单': is_big,
-                '连续': consecutive
-            })
-        return jsonify(tick_list)
-    except Exception as e:
-        return jsonify({"error": str(e)}),500
-
-# ---------- 资金强度统计（基于分笔）----------
-@app.route('/api/adv_stats/<code>')
-def adv_stats(code):
-    symbol = code.replace('.','').replace('SZ','sz').replace('SH','sh')
-    try:
-        df = ak.stock_zh_a_tick_tx_js(symbol=symbol)
-        if df is None or df.empty:
-            return jsonify({"error":"no data"}),404
-        # 处理方向
-        df['性质'] = df['性质'].astype(str)
-        df['方向'] = df['性质'].apply(lambda x: 'B' if '买' in x else 'S')
-        df['成交量'] = pd.to_numeric(df['成交量'], errors='coerce').fillna(0)
-        # 5分钟净流入
-        df['时间'] = pd.to_datetime(df['成交时间'], format='%H:%M:%S')
-        now = df['时间'].max()
-        five_min_ago = now - pd.Timedelta(minutes=5)
-        recent = df[(df['时间'] >= five_min_ago) & (df['时间'] <= now)]
-        net_inflow = (recent[recent['方向']=='B']['成交量'].sum() - recent[recent['方向']=='S']['成交量'].sum())
-        # 主动买卖比
-        buy_vol = df[df['方向']=='B']['成交量'].sum()
-        sell_vol = df[df['方向']=='S']['成交量'].sum()
-        ratio = buy_vol / sell_vol if sell_vol != 0 else 0
-        # 大单占比
-        big_thresh = 500
-        big_vol = df[df['成交量'] >= big_thresh]['成交量'].sum()
-        total_vol = df['成交量'].sum()
-        big_ratio = big_vol / total_vol if total_vol > 0 else 0
-        # 连续买单统计
-        df['连续组'] = (df['方向'] != df['方向'].shift()).cumsum()
-        consecutive_groups = df[df['方向']=='B'].groupby('连续组').agg({'成交量':'sum','方向':'first'})
-        max_consecutive_vol = consecutive_groups['成交量'].max() if not consecutive_groups.empty else 0
-        return jsonify({
-            '5分钟净流入': int(net_inflow),
-            '主动买/卖比': round(ratio,2),
-            '大单占比': round(big_ratio*100,1),
-            '连续买单最大量': int(max_consecutive_vol)
-        })
-    except Exception as e:
-        return jsonify({"error": str(e)}),500
+        return jsonify({"error": str(e)}), 500
 
 # ---------- 分钟K线 ----------
 @app.route('/api/minute_kline/<code>')
@@ -167,9 +109,12 @@ def minute_kline(code):
     today = datetime.now().strftime('%Y%m%d')
     try:
         url = "http://push2his.eastmoney.com/api/qt/stock/kline/get"
-        params = {'secid': secid, 'fields1': 'f1,f2,f3,f4,f5,f6',
-                  'fields2': 'f51,f52,f53,f54,f55,f56,f57',
-                  'klt': '1', 'fqt': '0', 'end': today, 'lmt': '240'}
+        params = {
+            'secid': secid,
+            'fields1': 'f1,f2,f3,f4,f5,f6',
+            'fields2': 'f51,f52,f53,f54,f55,f56,f57',
+            'klt': '1', 'fqt': '0', 'end': today, 'lmt': '240'
+        }
         h = {'Referer': 'https://quote.eastmoney.com/'}
         r = requests.get(url, params=params, headers=h, timeout=5)
         res = r.json()
@@ -185,13 +130,85 @@ def minute_kline(code):
                         'volume': int(parts[5]),
                         'amount': float(parts[6])
                     })
-            return jsonify({"success":True, "data":data})
+            return jsonify({"success": True, "data": data})
         else:
-            return jsonify({"error":"no data"}),404
+            return jsonify({"error": "no data"}), 404
     except Exception as e:
-        return jsonify({"error":str(e)}),500
+        return jsonify({"error": str(e)}), 500
 
-# ---------- 前端模板 ----------
+# ---------- 分时成交明细（增强版） ----------
+@app.route('/api/tick_data/<code>')
+def tick_data(code):
+    symbol = code.replace('.', '').replace('SZ', 'sz').replace('SH', 'sh')
+    try:
+        df = ak.stock_zh_a_tick_tx_js(symbol=symbol)
+        if df is None or df.empty:
+            return jsonify({"error": "no data"}), 404
+        records = []
+        prev_dir = None
+        cnt = 0
+        for _, row in df.iterrows():
+            t = str(row.get('成交时间', ''))
+            price = float(row.get('成交价格', 0))
+            vol = int(row.get('成交量', 0))
+            nature = row.get('性质', '')
+            direction = 'B' if '买' in str(nature) else 'S'
+            is_big = vol >= 500
+            if direction == prev_dir:
+                cnt += 1
+            else:
+                cnt = 1
+                prev_dir = direction
+            consecutive = cnt >= 3
+            records.append({
+                '时间': t,
+                '价格': price,
+                '成交': vol,
+                '方向': direction,
+                '超大单': is_big,
+                '连续': consecutive
+            })
+        return jsonify(records)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# ---------- 资金强度统计 ----------
+@app.route('/api/adv_stats/<code>')
+def adv_stats(code):
+    symbol = code.replace('.', '').replace('SZ', 'sz').replace('SH', 'sh')
+    try:
+        df = ak.stock_zh_a_tick_tx_js(symbol=symbol)
+        if df is None or df.empty:
+            return jsonify({"error": "no data"}), 404
+        df['性质'] = df['性质'].astype(str)
+        df['方向'] = df['性质'].apply(lambda x: 'B' if '买' in x else 'S')
+        df['成交量'] = pd.to_numeric(df['成交量'], errors='coerce').fillna(0)
+        df['时间'] = pd.to_datetime(df['成交时间'], format='%H:%M:%S')
+        now = df['时间'].max()
+        five_min_ago = now - pd.Timedelta(minutes=5)
+        recent = df[(df['时间'] >= five_min_ago) & (df['时间'] <= now)]
+        net5 = int(recent[recent['方向'] == 'B']['成交量'].sum() - recent[recent['方向'] == 'S']['成交量'].sum())
+        buy_vol = df[df['方向'] == 'B']['成交量'].sum()
+        sell_vol = df[df['方向'] == 'S']['成交量'].sum()
+        ratio = round(buy_vol / sell_vol, 2) if sell_vol != 0 else 0
+        big_vol = df[df['成交量'] >= 500]['成交量'].sum()
+        total_vol = df['成交量'].sum()
+        big_ratio = round(big_vol / total_vol * 100, 1) if total_vol > 0 else 0
+        df['连续组'] = (df['方向'] != df['方向'].shift()).cumsum()
+        groups = df[df['方向'] == 'B'].groupby('连续组').agg({'成交量': 'sum'})
+        max_cons = int(groups['成交量'].max()) if not groups.empty else 0
+        return jsonify({
+            '5分钟净流入': net5,
+            '主动买/卖比': ratio,
+            '大单占比': big_ratio,
+            '连续买单最大量': max_cons
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# ============================================================
+# 仪表盘模板
+# ============================================================
 HTML_DASHBOARD = r"""
 <!DOCTYPE html>
 <html lang="zh">
@@ -220,7 +237,6 @@ HTML_DASHBOARD = r"""
         async function loadDashboard() {
             const resp = await fetch('/api/batch_quote?codes='+CODES.join(','));
             const quotes = await resp.json();
-            // 计算龙头指标
             let stats = CODES.map(c => ({code:c, ...quotes[c]})).filter(q => q.price);
             const maxChg = Math.max(...stats.map(s => (s.price-s.last_close)/s.last_close));
             const minChg = Math.min(...stats.map(s => (s.price-s.last_close)/s.last_close));
@@ -233,7 +249,6 @@ HTML_DASHBOARD = r"""
                 s.isVolumeUp = s.volume_ratio === maxVratio;
                 s.isVolumeDown = s.volume_ratio === minVratio && minVratio < 0.8;
             });
-            // 渲染卡片
             const grid = document.getElementById('stockGrid');
             grid.innerHTML = '';
             for (let s of stats) {
@@ -252,7 +267,6 @@ HTML_DASHBOARD = r"""
                     <div class="metrics"><span>量比</span><span>${(s.volume_ratio||0).toFixed(2)}</span></div>
                     <div id="chart_${s.code}" class="sparkline"></div>`;
                 grid.appendChild(card);
-                // 加载微型分时图
                 loadSparkline(s.code, 'chart_'+s.code);
             }
         }
@@ -283,6 +297,9 @@ HTML_DASHBOARD = r"""
 </html>
 """
 
+# ============================================================
+# 单股详情模板
+# ============================================================
 HTML_STOCK_DETAIL = r"""
 <!DOCTYPE html>
 <html lang="zh">
@@ -351,21 +368,31 @@ HTML_STOCK_DETAIL = r"""
             }
         }
         async function loadOrderBook(){
-            const r = await fetch('/api/quote/'+code);  // 复用已有接口，五档需专门接口，这里简化略
-            // 实际应调用 /api/quote_detail/<code>，此处为了代码长度用模板中字段
-            // 请参考文档，这里不再展开
+            const r = await fetch('/api/quote/'+code);
+            const d = await r.json();
+            if(!d.error){
+                let html = '<div class="grid2">';
+                html += '<div><h4>买盘</h4><table><tr><th>价格</th><th>数量(手)</th></tr>';
+                if(d.buy5) d.buy5.forEach(b => html += `<tr><td>${b.price.toFixed(2)}</td><td>${b.volume}</td></tr>`);
+                html += '</table></div>';
+                html += '<div><h4>卖盘</h4><table><tr><th>价格</th><th>数量(手)</th></tr>';
+                if(d.sell5) d.sell5.forEach(s => html += `<tr><td>${s.price.toFixed(2)}</td><td>${s.volume}</td></tr>`);
+                html += '</table></div>';
+                document.getElementById('orderBook').innerHTML = html;
+            }
         }
         async function loadTicks(){
             const r = await fetch('/api/tick_data/'+code);
             const ticks = await r.json();
             let html = '<thead><tr><th>时间</th><th>价格</th><th>成交(手)</th><th>性质</th></tr></thead><tbody>';
-            let prevDir = null, cnt=0;
-            ticks.forEach(t => {
-                let cls = t['方向']=='B' ? 'color:#e74c3c' : 'color:#2ecc71';
-                if (t['超大单']) cls += ' big-tick';
-                if (t['连续']) cls += ' consecutive-tick';
-                html += `<tr style="${cls}"><td>${t['时间']}</td><td>${t['价格']}</td><td>${t['成交']}</td><td>${t['方向']}</td></tr>`;
-            });
+            if(Array.isArray(ticks)){
+                ticks.forEach(t => {
+                    let cls = t['方向']=='B' ? 'color:#e74c3c' : 'color:#2ecc71';
+                    if (t['超大单']) cls += ' big-tick';
+                    if (t['连续']) cls += ' consecutive-tick';
+                    html += `<tr style="${cls}"><td>${t['时间']}</td><td>${t['价格']}</td><td>${t['成交']}</td><td>${t['方向']}</td></tr>`;
+                });
+            }
             html += '</tbody>';
             document.getElementById('tickTable').innerHTML = html;
         }
