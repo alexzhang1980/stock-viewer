@@ -7,7 +7,7 @@ import akshare as ak
 
 app = Flask(__name__)
 
-# ========== 工具函数（供详情页使用） ==========
+# ========== 工具函数 ==========
 def code_to_eastmoney_secid(code):
     code = code.lower()
     if code.startswith('sh'):
@@ -21,8 +21,7 @@ def code_to_eastmoney_secid(code):
 def normalize_symbol(code):
     return code.replace('.', '').replace('sz', '').replace('SZ', '').replace('sh', '').replace('SH', '')
 
-# ========== 以下接口仅供单股详情页调用，仪表盘不依赖它们 ==========
-
+# ========== 单股详情页所需 API ==========
 @app.route('/api/quote/<code>')
 def quote_detail(code):
     secid = code_to_eastmoney_secid(code)
@@ -166,323 +165,252 @@ def adv_stats(code):
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# ========== 前端模板 ==========
-
-# 全新仪表盘（你提供的页面，直接请求东方财富API，15秒自动刷新）
+# ============================================================
+# 仪表盘模板（修正版：稳定图表渲染）
+# ============================================================
 HTML_DASHBOARD = r"""
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>半导体六股联动监控台</title>
-  <script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
-  <style>
-    body {
-      margin: 0;
-      font-family: Arial, "Microsoft YaHei", sans-serif;
-      background: #f3f4f6;
-      color: #111827;
-    }
-    header {
-      padding: 14px 20px;
-      background: #111827;
-      color: white;
-      font-size: 20px;
-      font-weight: bold;
-    }
-    .summary {
-      display: grid;
-      grid-template-columns: repeat(6, 1fr);
-      gap: 10px;
-      padding: 12px;
-    }
-    .card {
-      background: white;
-      border-radius: 12px;
-      padding: 12px;
-      box-shadow: 0 2px 8px rgba(0,0,0,0.08);
-    }
-    .name {
-      font-weight: bold;
-      font-size: 18px;
-    }
-    .price {
-      font-size: 24px;
-      font-weight: bold;
-      margin-top: 6px;
-    }
-    .red { color: #dc2626; }
-    .green { color: #16a34a; }
-    .gray { color: #6b7280; }
-    .chart {
-      height: 120px;
-      margin-top: 8px;
-    }
-    .info {
-      font-size: 13px;
-      line-height: 1.8;
-      margin-top: 8px;
-    }
-    .decision {
-      margin-top: 8px;
-      padding: 8px;
-      border-radius: 8px;
-      background: #f9fafb;
-      font-size: 13px;
-    }
-    .buy { color: #dc2626; font-weight: bold; }
-    .wait { color: #f97316; font-weight: bold; }
-    .risk { color: #16a34a; font-weight: bold; }
-    footer {
-      padding: 12px 20px;
-      font-size: 13px;
-      color: #6b7280;
-    }
-  </style>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>半导体六股联动监控台</title>
+<script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
+<style>
+body{margin:0;font-family:Arial,"Microsoft YaHei";background:#f3f4f6;color:#111827}
+header{padding:14px 20px;background:#111827;color:#fff;font-size:20px;font-weight:bold}
+#time{font-size:13px;color:#9ca3af;margin-top:4px}
+.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;padding:12px}
+.card{background:#fff;border-radius:12px;padding:12px;box-shadow:0 2px 8px rgba(0,0,0,.08)}
+.name{font-size:18px;font-weight:bold}
+.code{color:#6b7280;font-size:13px}
+.price{font-size:24px;font-weight:bold;margin-top:6px}
+.red{color:#dc2626}.green{color:#16a34a}.orange{color:#f97316}.gray{color:#6b7280}
+.chart{height:160px;width:100%;margin-top:8px}
+.info{font-size:13px;line-height:1.8;margin-top:8px}
+.decision{margin-top:8px;padding:8px;border-radius:8px;background:#f9fafb;font-size:13px;line-height:1.7}
+footer{padding:12px 20px;font-size:13px;color:#6b7280}
+@media(max-width:1000px){.grid{grid-template-columns:repeat(2,1fr)}}
+@media(max-width:650px){.grid{grid-template-columns:1fr}}
+</style>
 </head>
 <body>
-
-<header>半导体六股联动监控台</header>
-
-<div class="summary" id="stockGrid"></div>
-
-<footer>
-  自动刷新：15秒一次。评分越高越强；低于5分原则上不追。当前版本适合辅助观察，不等于自动买卖建议。
-</footer>
-
+<header>
+  半导体六股联动监控台
+  <div id="time">等待刷新...</div>
+</header>
+<div class="grid" id="grid"></div>
+<footer>自动刷新：15秒一次。评分越高越强；低于5分原则上不追。当前版本适合辅助观察，不等于自动买卖建议。</footer>
 <script>
-const stocks = [
-  { code: "sh688981", name: "中芯国际", marketCode: "1.688981" },
-  { code: "sh603986", name: "兆易创新", marketCode: "1.603986" },
-  { code: "sh688256", name: "寒武纪", marketCode: "1.688256" },
-  { code: "sz002371", name: "北方华创", marketCode: "0.002371" },
-  { code: "sh688041", name: "海光信息", marketCode: "1.688041" },
-  { code: "sh603501", name: "豪威集团", marketCode: "1.603501" }
+const stocks=[
+  {code:"sh688981",name:"中芯国际",secid:"1.688981"},
+  {code:"sh603986",name:"兆易创新",secid:"1.603986"},
+  {code:"sh688256",name:"寒武纪",secid:"1.688256"},
+  {code:"sz002371",name:"北方华创",secid:"0.002371"},
+  {code:"sh688041",name:"海光信息",secid:"1.688041"},
+  {code:"sh603501",name:"豪威集团",secid:"1.603501"}
 ];
 
-async function fetchStock(stock) {
-  const url = `https://push2.eastmoney.com/api/qt/stock/get?secid=${stock.marketCode}&fields=f43,f44,f45,f46,f47,f48,f49,f50,f57,f58,f60,f86,f169,f170,f171`;
-  const res = await fetch(url);
-  const json = await res.json();
-  const d = json.data || {};
+// 保存所有图表实例，方便销毁
+let allCharts = {};
 
+function destroyAllCharts() {
+  Object.keys(allCharts).forEach(key => {
+    if (allCharts[key]) {
+      allCharts[key].dispose();
+      delete allCharts[key];
+    }
+  });
+}
+
+function money(v){
+  if(!v) return "--";
+  if(v>=1e8) return (v/1e8).toFixed(2)+"亿";
+  if(v>=1e4) return (v/1e4).toFixed(2)+"万";
+  return v;
+}
+
+async function getJson(url){
+  const r = await fetch(url + "&_=" + Date.now(), {cache:"no-store"});
+  return await r.json();
+}
+
+async function fetchBase(s){
+  const url = `https://push2.eastmoney.com/api/qt/stock/get?secid=${s.secid}&fields=f43,f44,f45,f46,f47,f48,f60,f169,f170,f171`;
+  const j = await getJson(url);
+  const d = j.data || {};
   return {
-    ...stock,
+    ...s,
     price: d.f43 / 100,
     high: d.f44 / 100,
     low: d.f45 / 100,
     open: d.f46 / 100,
     volume: d.f47,
     amount: d.f48,
-    prevClose: d.f60 / 100,
+    prev: d.f60 / 100,
     change: d.f169 / 100,
     pct: d.f170 / 100,
-    amplitude: d.f171 / 100
+    amp: d.f171 / 100
   };
 }
 
-async function fetchMinute(stock) {
-  const url = `https://push2his.eastmoney.com/api/qt/stock/trends2/get?secid=${stock.marketCode}&fields1=f1,f2,f3,f4,f5,f6,f7,f8&fields2=f51,f52,f53,f54,f55,f56,f57,f58`;
-  const res = await fetch(url);
-  const json = await res.json();
-  const trends = json.data?.trends || [];
-
-  return trends.map(x => {
-    const arr = x.split(",");
+async function fetchMinute(s){
+  const url = `https://push2his.eastmoney.com/api/qt/stock/trends2/get?secid=${s.secid}&fields1=f1,f2,f3,f4,f5,f6,f7,f8&fields2=f51,f52,f53,f54,f55,f56,f57,f58`;
+  const j = await getJson(url);
+  const arr = j.data?.trends || [];
+  return arr.map(x => {
+    const a = x.split(",");
     return {
-      time: arr[0],
-      price: Number(arr[1]),
-      avg: Number(arr[2]),
-      volume: Number(arr[5])
+      time: a[0],
+      price: Number(a[1]),
+      avg: Number(a[2]),
+      volume: Number(a[5])
     };
-  });
+  }).filter(x => x.price > 0);
 }
 
-function calcDecision(stock, minutes) {
-  let score = 0;
-  let reason = [];
-
-  const latest = minutes[minutes.length - 1];
-  const prev = minutes[Math.max(0, minutes.length - 6)];
-
-  if (!latest) {
-    return {
-      score: 0,
-      action: "数据不足",
-      risk: "无法判断",
-      trend: "未知",
-      reason: "分时数据不足"
-    };
-  }
-
-  if (stock.pct > 0) {
-    score += 2;
-    reason.push("股价红盘");
-  }
-
-  if (latest.price > latest.avg) {
-    score += 2;
-    reason.push("站上均价线");
-  } else {
-    reason.push("低于均价线");
-  }
-
-  if (latest.price > prev.price) {
-    score += 2;
-    reason.push("近几分钟回升");
-  } else {
-    reason.push("近几分钟偏弱");
-  }
-
-  const recentVolumes = minutes.slice(-5).map(x => x.volume);
-  const avgVolume = minutes.reduce((s, x) => s + x.volume, 0) / minutes.length;
-  const recentAvg = recentVolumes.reduce((s, x) => s + x, 0) / recentVolumes.length;
-
-  if (recentAvg > avgVolume * 1.5) {
-    score += 2;
-    reason.push("短线放量");
-  } else {
-    reason.push("量能平稳");
-  }
-
-  if (stock.pct < -3) {
-    score -= 2;
-    reason.push("跌幅较大");
-  }
-
-  let action = "继续观察";
-  let risk = "中性偏弱";
-  let trend = "震荡";
-
-  if (score >= 7) {
-    action = "可小仓试探";
-    risk = "中等";
-    trend = "转强";
-  } else if (score >= 5) {
-    action = "等待确认";
-    risk = "中性";
-    trend = "修复中";
-  } else {
-    action = "不买，观望";
-    risk = "偏高";
-    trend = "弱势";
-  }
-
-  return {
-    score,
-    action,
-    risk,
-    trend,
-    reason: reason.join("；")
-  };
+function judge(stock, m){
+  if(!m.length) return {score:0, action:"数据不足", risk:"无法判断", trend:"未知", reason:"暂无分时数据"};
+  let score = 0, reason = [];
+  const last = m[m.length-1];
+  const prev = m[Math.max(0, m.length-6)];
+  if(stock.pct > 0) { score += 2; reason.push("红盘"); }
+  else reason.push("绿盘");
+  if(last.price > last.avg) { score += 2; reason.push("站上均价线"); }
+  else reason.push("低于均价线");
+  if(last.price > prev.price) { score += 2; reason.push("近5分钟回升"); }
+  else reason.push("近5分钟偏弱");
+  const avgVol = m.reduce((a,b) => a + b.volume, 0) / m.length;
+  const recentVol = m.slice(-5).reduce((a,b) => a + b.volume, 0) / Math.min(5, m.length);
+  if(recentVol > avgVol * 1.5) { score += 2; reason.push("短线放量"); }
+  else reason.push("量能平稳");
+  if(stock.pct < -3) { score -= 2; reason.push("跌幅偏大"); }
+  let action = "不买，观望", risk = "偏高", trend = "弱势";
+  if(score >= 7) { action = "可小仓试探"; risk = "中等"; trend = "转强"; }
+  else if(score >= 5) { action = "等待确认"; risk = "中性"; trend = "修复中"; }
+  return { score, action, risk, trend, reason: reason.join("；") };
 }
 
-function renderCard(stock, minutes, decision) {
-  const color = stock.pct >= 0 ? "red" : "green";
-  const id = `chart-${stock.code}`;
-
+function cardHtml(s, j){
+  const c = s.pct >= 0 ? "red" : "green";
+  const actionClass = j.score >= 7 ? "red" : j.score >= 5 ? "orange" : "green";
   return `
-    <div class="card">
-      <div class="name">${stock.name}</div>
-      <div class="gray">${stock.code}</div>
-      <div class="price ${color}">${stock.price?.toFixed(2) ?? "--"}</div>
-      <div class="${color}">涨幅：${stock.pct?.toFixed(2) ?? "--"}%</div>
-      <div id="${id}" class="chart"></div>
-
-      <div class="info">
-        当前价：${stock.price?.toFixed(2) ?? "--"}<br/>
-        今开：${stock.open?.toFixed(2) ?? "--"}<br/>
-        最高：${stock.high?.toFixed(2) ?? "--"}<br/>
-        最低：${stock.low?.toFixed(2) ?? "--"}<br/>
-        昨收：${stock.prevClose?.toFixed(2) ?? "--"}<br/>
-        成交额：${formatAmount(stock.amount)}
-      </div>
-
-      <div class="decision">
-        评分：<b>${decision.score}</b><br/>
-        操作：<span class="${decision.score >= 7 ? "buy" : decision.score >= 5 ? "wait" : "risk"}">${decision.action}</span><br/>
-        风险：${decision.risk}<br/>
-        趋势：${decision.trend}<br/>
-        理由：${decision.reason}
-      </div>
+  <div class="card">
+    <div class="name">${s.name}</div>
+    <div class="code">${s.code}</div>
+    <div class="price ${c}">${isFinite(s.price) ? s.price.toFixed(2) : "--"}</div>
+    <div class="${c}">涨幅：${isFinite(s.pct) ? s.pct.toFixed(2) : "--"}%</div>
+    <div class="chart" id="chart-${s.code}"></div>
+    <div class="info">
+      当前价：${s.price?.toFixed(2) ?? "--"}<br>
+      今开：${s.open?.toFixed(2) ?? "--"}　
+      最高：${s.high?.toFixed(2) ?? "--"}　
+      最低：${s.low?.toFixed(2) ?? "--"}<br>
+      昨收：${s.prev?.toFixed(2) ?? "--"}　
+      成交额：${money(s.amount)}
     </div>
-  `;
+    <div class="decision">
+      评分：<b>${j.score}</b><br>
+      操作：<span class="${actionClass}"><b>${j.action}</b></span><br>
+      风险：${j.risk}<br>
+      趋势：${j.trend}<br>
+      理由：${j.reason}
+    </div>
+  </div>`;
 }
 
-function drawChart(stock, minutes) {
-  const chart = echarts.init(document.getElementById(`chart-${stock.code}`));
+function drawChart(s, m){
+  const el = document.getElementById(`chart-${s.code}`);
+  if (!el) return;
+  // 确保容器有尺寸
+  if (el.clientWidth === 0 || el.clientHeight === 0) {
+    // 延迟再试
+    setTimeout(() => drawChart(s, m), 100);
+    return;
+  }
+  // 如果已有实例先销毁
+  if (allCharts[s.code]) {
+    allCharts[s.code].dispose();
+  }
+  const chart = echarts.init(el);
+  allCharts[s.code] = chart;
+  const times = m.map(x => x.time.slice(11, 16));
+  const prices = m.map(x => x.price);
+  const avgs = m.map(x => x.avg);
   chart.setOption({
-    grid: { left: 0, right: 0, top: 8, bottom: 0 },
-    xAxis: {
-      type: "category",
-      data: minutes.map(x => x.time.slice(11, 16)),
-      show: false
-    },
-    yAxis: {
-      type: "value",
-      show: false,
-      scale: true
-    },
+    animation: false,
+    grid: { left: 8, right: 8, top: 10, bottom: 10 },
+    tooltip: { trigger: 'axis' },
+    xAxis: { type: 'category', data: times, show: false },
+    yAxis: { type: 'value', scale: true, show: false },
     series: [
-      {
-        type: "line",
-        data: minutes.map(x => x.price),
-        showSymbol: false,
-        lineStyle: { width: 1.5 },
-        areaStyle: { opacity: 0.15 }
-      },
-      {
-        type: "line",
-        data: minutes.map(x => x.avg),
-        showSymbol: false,
-        lineStyle: { width: 1, type: "dashed" }
-      }
+      { name: '价格', type: 'line', data: prices, showSymbol: false, smooth: true, lineStyle: { width: 1.6 }, areaStyle: { opacity: 0.12 } },
+      { name: '均价', type: 'line', data: avgs, showSymbol: false, smooth: true, lineStyle: { width: 1, type: 'dashed' } }
     ]
   });
+  // 强制 resize 一次
+  setTimeout(() => chart.resize(), 50);
 }
 
-function formatAmount(value) {
-  if (!value) return "--";
-  if (value >= 100000000) return (value / 100000000).toFixed(2) + "亿";
-  if (value >= 10000) return (value / 10000).toFixed(2) + "万";
-  return value;
-}
+async function load(){
+  const grid = document.getElementById("grid");
+  // 先销毁所有旧图表
+  destroyAllCharts();
 
-async function loadAll() {
-  const grid = document.getElementById("stockGrid");
-  grid.innerHTML = "";
-
+  // 构建卡片数据
+  const cardsData = [];
   for (const s of stocks) {
     try {
-      const stock = await fetchStock(s);
-      const minutes = await fetchMinute(s);
-      const decision = calcDecision(stock, minutes);
-
-      grid.innerHTML += renderCard(stock, minutes, decision);
-
-      setTimeout(() => drawChart(stock, minutes), 50);
+      const base = await fetchBase(s);
+      const minute = await fetchMinute(s);
+      const j = judge(base, minute);
+      cardsData.push({ base, minute, decision: j });
     } catch (e) {
-      grid.innerHTML += `
-        <div class="card">
-          <div class="name">${s.name}</div>
-          <div class="gray">${s.code}</div>
-          <div class="risk">数据读取失败</div>
-        </div>
-      `;
+      // 如果某只股票获取失败，保留占位卡片
+      cardsData.push({ error: true, name: s.name, code: s.code });
     }
   }
+
+  // 一次性生成所有 HTML
+  let html = '';
+  for (const cd of cardsData) {
+    if (cd.error) {
+      html += `<div class="card"><div class="name">${cd.name}</div><div class="code">${cd.code}</div><div class="green">数据读取失败，等待下次刷新</div></div>`;
+    } else {
+      html += cardHtml(cd.base, cd.decision);
+    }
+  }
+  grid.innerHTML = html;
+
+  // 等待浏览器渲染完成后，批量创建图表
+  requestAnimationFrame(() => {
+    cardsData.forEach(cd => {
+      if (!cd.error) {
+        drawChart(cd.base, cd.minute);
+      }
+    });
+  });
+
+  document.getElementById("time").innerText = "最后刷新：" + new Date().toLocaleTimeString();
 }
 
-loadAll();
-setInterval(loadAll, 15000);
-</script>
+window.addEventListener("resize", () => {
+  Object.keys(allCharts).forEach(key => {
+    if (allCharts[key]) allCharts[key].resize();
+  });
+});
 
+// 启动并定时刷新
+load();
+setInterval(load, 15000);
+</script>
 </body>
 </html>
 """
 
-# 单股详情页（保持不变）
+# ============================================================
+# 单股详情页模板（保留原版）
+# ============================================================
 HTML_STOCK_DETAIL = r"""
 <!DOCTYPE html>
 <html lang="zh">
