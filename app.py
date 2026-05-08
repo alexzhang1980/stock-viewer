@@ -2,7 +2,6 @@ from flask import Flask, jsonify, render_template_string
 import requests
 import time
 import statistics
-import traceback
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
@@ -17,11 +16,11 @@ STOCKS = [
     {"name": "豪威集团", "code": "603501", "secid": "1.603501"},
 ]
 
-# 全局 session，支持自动重试
+# 全局 session 复用连接
 session = requests.Session()
 retries = Retry(total=2, backoff_factor=0.5, status_forcelist=[500, 502, 503, 504])
-session.mount('https://', HTTPAdapter(max_retries=retries))
-session.mount('http://', HTTPAdapter(max_retries=retries))
+session.mount('https://', HTTPAdapter(max_retries=retries, pool_connections=10, pool_maxsize=20))
+session.mount('http://', HTTPAdapter(max_retries=retries, pool_connections=10, pool_maxsize=20))
 
 def safe_float(x, div=1):
     try:
@@ -32,7 +31,6 @@ def safe_float(x, div=1):
         return None
 
 def fetch_quote(secid):
-    """获取实时行情（带重试）"""
     url = "https://push2.eastmoney.com/api/qt/stock/get"
     params = {
         "secid": secid,
@@ -40,13 +38,12 @@ def fetch_quote(secid):
         "_": int(time.time() * 1000),
     }
     try:
-        r = session.get(url, params=params, timeout=(3.05, 8))
+        r = session.get(url, params=params, timeout=(3.05, 10))
         data = r.json().get("data") or {}
     except Exception:
-        # 第一次失败后短暂等待再试
-        time.sleep(0.5)
+        time.sleep(1)
         try:
-            r = session.get(url, params=params, timeout=(3.05, 8))
+            r = session.get(url, params=params, timeout=(3.05, 10))
             data = r.json().get("data") or {}
         except Exception:
             return {}
@@ -54,7 +51,7 @@ def fetch_quote(secid):
     pre_close = safe_float(data.get("f60"), 100)
     price = safe_float(data.get("f43"), 100)
     if price is None:
-        price = pre_close  # 非交易时段显示昨收
+        price = pre_close
 
     return {
         "price": price,
@@ -72,24 +69,21 @@ def fetch_quote(secid):
     }
 
 def fetch_trend(secid):
-    """获取分时数据（带重试）"""
     url = "https://push2his.eastmoney.com/api/qt/stock/trends2/get"
     params = {
         "secid": secid,
         "fields1": "f1,f2,f3,f4,f5,f6,f7,f8",
         "fields2": "f51,f52,f53,f54,f55,f56,f57,f58",
-        "iscr": "0",
-        "iscca": "0",
-        "ndays": "1",
+        "iscr": "0", "iscca": "0", "ndays": "1",
         "_": int(time.time() * 1000),
     }
     try:
-        r = session.get(url, params=params, timeout=(3.05, 8))
+        r = session.get(url, params=params, timeout=(3.05, 10))
         trends = (r.json().get("data") or {}).get("trends") or []
     except Exception:
-        time.sleep(0.5)
+        time.sleep(1)
         try:
-            r = session.get(url, params=params, timeout=(3.05, 8))
+            r = session.get(url, params=params, timeout=(3.05, 10))
             trends = (r.json().get("data") or {}).get("trends") or []
         except Exception:
             return []
@@ -185,7 +179,6 @@ def api_data():
             result.append({
                 "name": s["name"],
                 "code": s["code"],
-                "secid": s["secid"],
                 "quote": quote,
                 "trend": trend,
                 "decision": decision,
@@ -194,7 +187,6 @@ def api_data():
             result.append({
                 "name": s["name"],
                 "code": s["code"],
-                "secid": s["secid"],
                 "error": str(e),
                 "quote": {},
                 "trend": [],
@@ -242,6 +234,7 @@ body{font-family:Arial,"Microsoft YaHei";background:#f3f4f6;margin:0;color:#1118
 .buy{background:#dcfce7;color:#166534}
 .wait{background:#fef9c3;color:#854d0e}
 .no{background:#fee2e2;color:#991b1b}
+.error-msg{color:red;margin-top:8px;font-size:13px}
 @media(max-width:1000px){.grid{grid-template-columns:1fr}}
 </style>
 </head>
@@ -252,66 +245,104 @@ body{font-family:Arial,"Microsoft YaHei";background:#f3f4f6;margin:0;color:#1118
   <p>强势股数量：<span id="strong">--</span></p>
   <p>弱势股数量：<span id="weak">--</span></p>
   <p>站上均线数量：<span id="above">--</span></p>
+  <p id="global-error" class="error-msg"></p>
 </div>
 <div class="grid" id="grid"></div>
 <script>
-async function loadData(){
-  const res = await fetch('/api/data?t=' + Date.now());
-  const data = await res.json();
-  document.getElementById('sector').innerText = data.sector.status;
-  document.getElementById('time').innerText = data.time;
-  document.getElementById('strong').innerText = data.sector.strong;
-  document.getElementById('weak').innerText = data.sector.weak;
-  document.getElementById('above').innerText = data.sector.above_avg;
-  const grid = document.getElementById('grid');
-  grid.innerHTML = '';
-  data.stocks.forEach((s, i) => {
-    const q = s.quote || {};
-    const d = s.decision || {};
-    const pct = q.pct ?? 0;
-    const colorClass = pct >= 0 ? 'red' : 'green';
-    let tagClass = 'wait';
-    if(d.score >= 5) tagClass = 'buy';
-    if(d.score <= -4) tagClass = 'no';
-    const div = document.createElement('div');
-    div.className = 'card';
-    div.innerHTML = `
-      <div class="name">${s.name}</div>
-      <div class="code">${s.code}</div>
-      <div class="price ${colorClass}">${q.price ?? '--'}</div>
-      <div class="${colorClass}">涨幅：${q.pct ?? '--'}%</div>
-      <div id="chart${i}" class="chart"></div>
-      <div class="info">
-        今开：${q.open ?? '--'}　最高：${q.high ?? '--'}　最低：${q.low ?? '--'}<br>
-        昨收：${q.pre_close ?? '--'}　成交额：${q.amount ?? '--'}亿<br>
-        换手：${q.turnover ?? '--'}%　流通市值：${q.float_cap ?? '--'}亿
-      </div>
-      <div class="decision">
-        <div>评分：<span class="big">${d.score}</span></div>
-        <div>操作提示：<span class="tag ${tagClass}">${d.action}</span></div>
-        <div>风险：${d.risk}</div>
-        <div>判断依据：${(d.reasons || []).join(' / ') || '暂无'}</div>
-        ${s.error ? `<div style="color:red;margin-top:4px;">异常：${s.error}</div>` : ''}
-      </div>
-    `;
-    grid.appendChild(div);
-    const chart = echarts.init(document.getElementById('chart'+i));
-    const times = (s.trend || []).map(x => x.time);
-    const prices = (s.trend || []).map(x => x.price);
-    const avgs = (s.trend || []).map(x => x.avg);
-    chart.setOption({
-      animation:false,
-      grid:{left:35,right:10,top:10,bottom:25},
-      xAxis:{type:'category',data:times,axisLabel:{show:false}},
-      yAxis:{type:'value',scale:true,axisLabel:{fontSize:10}},
-      series:[
-        {name:'价格',type:'line',data:prices,smooth:true,symbol:'none',lineStyle:{width:2}},
-        {name:'均价',type:'line',data:avgs,smooth:true,symbol:'none',lineStyle:{width:1,type:'dashed'}}
-      ],
-      tooltip:{trigger:'axis'}
-    });
-  });
+// 全局错误显示
+function showGlobalError(msg) {
+    const el = document.getElementById('global-error');
+    if (el) el.innerText = msg || '';
 }
+
+async function fetchWithRetry(url, retries = 2, delay = 2000) {
+    for (let i = 0; i <= retries; i++) {
+        try {
+            const res = await fetch(url);
+            if (!res.ok) throw new Error('HTTP ' + res.status);
+            return await res.json();
+        } catch (err) {
+            if (i === retries) throw err;
+            console.warn(`请求失败，${delay/1000}秒后重试... (${i+1}/${retries})`);
+            await new Promise(r => setTimeout(r, delay));
+        }
+    }
+}
+
+async function loadData(){
+    showGlobalError('');
+    try {
+        const data = await fetchWithRetry('/api/data?t=' + Date.now());
+        if (!data || !data.stocks) throw new Error('返回数据为空');
+
+        document.getElementById('sector').innerText = data.sector.status;
+        document.getElementById('time').innerText = data.time;
+        document.getElementById('strong').innerText = data.sector.strong;
+        document.getElementById('weak').innerText = data.sector.weak;
+        document.getElementById('above').innerText = data.sector.above_avg;
+
+        const grid = document.getElementById('grid');
+        grid.innerHTML = '';
+
+        data.stocks.forEach((s, i) => {
+            const q = s.quote || {};
+            const d = s.decision || {};
+            const pct = q.pct ?? 0;
+            const colorClass = pct >= 0 ? 'red' : 'green';
+            let tagClass = 'wait';
+            if(d.score >= 5) tagClass = 'buy';
+            else if(d.score <= -4) tagClass = 'no';
+
+            const div = document.createElement('div');
+            div.className = 'card';
+            div.innerHTML = `
+                <div class="name">${s.name}</div>
+                <div class="code">${s.code}</div>
+                <div class="price ${colorClass}">${q.price ?? '--'}</div>
+                <div class="${colorClass}">涨幅：${q.pct ?? '--'}%</div>
+                <div id="chart${i}" class="chart"></div>
+                <div class="info">
+                    今开：${q.open ?? '--'}　最高：${q.high ?? '--'}　最低：${q.low ?? '--'}<br>
+                    昨收：${q.pre_close ?? '--'}　成交额：${q.amount ?? '--'}亿<br>
+                    换手：${q.turnover ?? '--'}%　流通市值：${q.float_cap ?? '--'}亿
+                </div>
+                <div class="decision">
+                    <div>评分：<span class="big">${d.score}</span></div>
+                    <div>操作提示：<span class="tag ${tagClass}">${d.action}</span></div>
+                    <div>风险：${d.risk}</div>
+                    <div>判断依据：${(d.reasons || []).join(' / ') || '暂无'}</div>
+                    ${s.error ? `<div style="color:red;margin-top:4px;">异常：${s.error}</div>` : ''}
+                </div>
+            `;
+            grid.appendChild(div);
+
+            // 确保图表容器已渲染再初始化
+            setTimeout(() => {
+                const chartDom = document.getElementById('chart'+i);
+                if (!chartDom) return;
+                const chart = echarts.init(chartDom);
+                const times = (s.trend || []).map(x => x.time);
+                const prices = (s.trend || []).map(x => x.price);
+                const avgs = (s.trend || []).map(x => x.avg);
+                chart.setOption({
+                    animation: false,
+                    grid: { left: 35, right: 10, top: 10, bottom: 25 },
+                    xAxis: { type: 'category', data: times, axisLabel: { show: false } },
+                    yAxis: { type: 'value', scale: true, axisLabel: { fontSize: 10 } },
+                    series: [
+                        { name: '价格', type: 'line', data: prices, smooth: true, symbol: 'none', lineStyle: { width: 2 } },
+                        { name: '均价', type: 'line', data: avgs, smooth: true, symbol: 'none', lineStyle: { width: 1, type: 'dashed' } }
+                    ],
+                    tooltip: { trigger: 'axis' }
+                });
+            }, 100);
+        });
+    } catch (err) {
+        console.error('数据加载失败:', err);
+        showGlobalError('数据加载失败：' + err.message + '，15秒后自动重试...');
+    }
+}
+
 loadData();
 setInterval(loadData, 15000);
 </script>
