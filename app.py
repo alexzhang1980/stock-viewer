@@ -23,12 +23,6 @@ STOCK_LIST = ['sh688981', 'sz002371', 'sh603501', 'sh688041', 'sh688256', 'sh603
 def normalize_symbol(code):
     return code.replace('.', '').replace('sz', '').replace('SZ', '').replace('sh', '').replace('SH', '')
 
-def _safe_price(val):
-    """确保价格被正确除以100，防止价格放大100倍"""
-    if val and val > 1000:  # 正常股价不可能大于1000
-        return round(val / 100, 2)
-    return round(val / 100, 2) if val else 0
-
 # ---------- 批量实时行情 ----------
 @app.route('/api/batch_quote')
 def batch_quote():
@@ -49,7 +43,6 @@ def batch_quote():
             d = r.json().get('data', {})
             if d:
                 price = d.get('f43', 0) / 100 if d.get('f43') else 0
-                # 二次保险：若价格异常高，则强制除以100
                 if price > 1e5:
                     price = round(price / 100, 2)
                 result[code] = {
@@ -66,12 +59,11 @@ def batch_quote():
             result[code] = {"error": str(e)}
     return jsonify(result)
 
-# ---------- 均价（支持盘后） ----------
+# ---------- 均价 ----------
 @app.route('/api/avg_price')
 def avg_price():
     code = request.args.get('code', 'sh688981')
     secid = code_to_eastmoney_secid(code)
-    # 先尝试实时均价接口
     try:
         url = "http://push2his.eastmoney.com/api/qt/stock/trends2/get"
         params = {
@@ -98,8 +90,7 @@ def avg_price():
                 return jsonify({"success": True, "avg_price": avg, "code": code})
     except:
         pass
-
-    # 盘后兜底：用分钟K线最后一根收盘价作为参考均价
+    # 盘后兜底：分钟K线最后一根收盘价
     try:
         url = "http://push2his.eastmoney.com/api/qt/stock/kline/get"
         today = datetime.now().strftime('%Y%m%d')
@@ -123,12 +114,11 @@ def avg_price():
         pass
     return jsonify({"success": False, "avg_price": None, "code": code})
 
-# ---------- 主动买/主动卖统计（支持盘后历史估算） ----------
+# ---------- 主动买/主动卖统计 ----------
 @app.route('/api/adv_stats_brief')
 def adv_stats_brief():
     code = request.args.get('code', 'sh688981')
     symbol = normalize_symbol(code)
-    # 先尝试当日分笔数据
     try:
         df = ak.stock_zh_a_tick_tx_js(symbol=symbol)
         if df is not None and not df.empty:
@@ -141,8 +131,7 @@ def adv_stats_brief():
                 return jsonify({"buy_vol": buy_vol, "sell_vol": sell_vol, "code": code})
     except:
         pass
-
-    # 盘后兜底：用最近30日日K的成交量估算
+    # 盘后估算
     try:
         secid = code_to_eastmoney_secid(code)
         url = "http://push2his.eastmoney.com/api/qt/stock/kline/get"
@@ -163,13 +152,11 @@ def adv_stats_brief():
                 if len(parts) >= 6:
                     total_vol += int(parts[5])
             avg_vol = total_vol // len(lines) if lines else 0
-            # 假设主动买占总量的55%，主动卖占45%  (A股历史统计均值)
             return jsonify({
                 "buy_vol": int(avg_vol * 0.55),
                 "sell_vol": int(avg_vol * 0.45),
                 "code": code,
-                "source": "近30日估算",
-                "note": "主动买/卖比为估算值，基于A股历史均值计算"
+                "source": "近30日估算"
             })
     except:
         pass
@@ -180,7 +167,6 @@ def adv_stats_brief():
 def big_order_ratio():
     code = request.args.get('code', 'sh688981')
     symbol = normalize_symbol(code)
-    # 先尝试当日分笔
     try:
         df = ak.stock_zh_a_tick_tx_js(symbol=symbol)
         if df is not None and not df.empty:
@@ -192,15 +178,7 @@ def big_order_ratio():
                 return jsonify({"big_ratio": ratio, "big_threshold": 500, "code": code})
     except:
         pass
-
-    # 盘后兜底：用历史大单占比平均值（约20%）
-    return jsonify({
-        "big_ratio": 18.5,
-        "big_threshold": 500,
-        "code": code,
-        "source": "历史均值估算(约18.5%)",
-        "note": "非交易时段暂无实时逐笔数据，显示A股历史大单占比均值"
-    })
+    return jsonify({"big_ratio": 18.5, "big_threshold": 500, "code": code, "source": "历史均值估算"})
 
 # ---------- 分钟K线 ----------
 @app.route('/api/minute_kline/<code>')
@@ -236,124 +214,35 @@ def minute_kline(code):
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# ---------- 单股盘口 ----------
-@app.route('/api/quote/<code>')
-def quote_detail(code):
-    secid = code_to_eastmoney_secid(code)
-    try:
-        url = "https://push2.eastmoney.com/api/qt/stock/get"
-        fields = ('f43,f44,f45,f46,f47,f48,f50,f57,f58,f60,f169,f170,'
-                  'f19,f20,f21,f22,f23,f24,f25,f26,f27,f28,f29,f30,f31,f32,f33,f34,f35,f36,f37')
-        params = {'secid': secid, 'fields': fields, 'invt': '2', 'fltt': '2'}
-        h = {'Referer': 'https://quote.eastmoney.com/'}
-        r = requests.get(url, params=params, headers=h, timeout=5)
-        d = r.json().get('data', {})
-        if not d:
-            return jsonify({"error": "no data"}), 404
-
-        def p(field): return d.get(field, 0) / 100 if d.get(field) else 0
-        def vol(field): return int(d.get(field, 0) or 0)
-
-        buy5 = [
-            {"price": p('f19'), "volume": vol('f20')},
-            {"price": p('f21'), "volume": vol('f22')},
-            {"price": p('f23'), "volume": vol('f24')},
-            {"price": p('f25'), "volume": vol('f26')},
-            {"price": p('f27'), "volume": vol('f28')},
-        ]
-        sell5 = [
-            {"price": p('f29'), "volume": vol('f30')},
-            {"price": p('f31'), "volume": vol('f32')},
-            {"price": p('f33'), "volume": vol('f34')},
-            {"price": p('f35'), "volume": vol('f36')},
-            {"price": p('f37'), "volume": vol('f38')},
-        ]
-
-        return jsonify({
-            "name": d.get('f58', ''),
-            "price": p('f43'),
-            "last_close": p('f60'),
-            "volume": d.get('f47', 0),
-            "amount": d.get('f48', 0),
-            "volume_ratio": d.get('f50', 0) / 100 if d.get('f50') else 0,
-            "buy5": buy5,
-            "sell5": sell5
-        })
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-# ---------- 分时成交明细 ----------
-@app.route('/api/tick_data/<code>')
-def tick_data(code):
+# ---------- 逐笔成交（近80笔） ----------
+@app.route('/api/recent_ticks/<code>')
+def recent_ticks(code):
     symbol = normalize_symbol(code)
     try:
         df = ak.stock_zh_a_tick_tx_js(symbol=symbol)
         if df is None or df.empty:
-            return jsonify({"error": "no data"}), 404
-        records = []
-        prev_dir = None
-        cnt = 0
+            return jsonify([])
+        ticks = []
         for _, row in df.iterrows():
-            t = str(row.get('成交时间', ''))
-            price = float(row.get('成交价格', 0))
-            vol = int(row.get('成交量', 0))
-            nature = row.get('性质', '')
-            direction = 'B' if '买' in str(nature) else 'S'
-            is_big = vol >= 500
-            if direction == prev_dir:
-                cnt += 1
-            else:
-                cnt = 1
-                prev_dir = direction
-            consecutive = cnt >= 3
-            records.append({
-                '时间': t,
-                '价格': price,
-                '成交': vol,
-                '方向': direction,
-                '超大单': is_big,
-                '连续': consecutive
+            nature = str(row.get('性质', ''))
+            side = 'N'
+            if '买' in nature:
+                side = 'B'
+            elif '卖' in nature:
+                side = 'S'
+            ticks.append({
+                'time': str(row.get('成交时间', '')),
+                'price': float(row.get('成交价格', 0)),
+                'volume': int(row.get('成交量', 0)),
+                'side': side
             })
-        return jsonify(records)
+        # 返回最近80笔
+        return jsonify(ticks[-80:])
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-# ---------- 资金强度统计 ----------
-@app.route('/api/adv_stats/<code>')
-def adv_stats(code):
-    symbol = normalize_symbol(code)
-    try:
-        df = ak.stock_zh_a_tick_tx_js(symbol=symbol)
-        if df is None or df.empty:
-            return jsonify({"error": "no data"}), 404
-        df['性质'] = df['性质'].astype(str)
-        df['方向'] = df['性质'].apply(lambda x: 'B' if '买' in x else 'S')
-        df['成交量'] = pd.to_numeric(df['成交量'], errors='coerce').fillna(0)
-        df['时间'] = pd.to_datetime(df['成交时间'], format='%H:%M:%S')
-        now = df['时间'].max()
-        five_min_ago = now - pd.Timedelta(minutes=5)
-        recent = df[(df['时间'] >= five_min_ago) & (df['时间'] <= now)]
-        net5 = int(recent[recent['方向'] == 'B']['成交量'].sum() - recent[recent['方向'] == 'S']['成交量'].sum())
-        buy_vol = df[df['方向'] == 'B']['成交量'].sum()
-        sell_vol = df[df['方向'] == 'S']['成交量'].sum()
-        ratio = round(buy_vol / sell_vol, 2) if sell_vol != 0 else 0
-        big_vol = df[df['成交量'] >= 500]['成交量'].sum()
-        total_vol = df['成交量'].sum()
-        big_ratio = round(big_vol / total_vol * 100, 1) if total_vol > 0 else 0
-        df['连续组'] = (df['方向'] != df['方向'].shift()).cumsum()
-        groups = df[df['方向'] == 'B'].groupby('连续组').agg({'成交量': 'sum'})
-        max_cons = int(groups['成交量'].max()) if not groups.empty else 0
-        return jsonify({
-            '5分钟净流入': net5,
-            '主动买/卖比': ratio,
-            '大单占比': big_ratio,
-            '连续买单最大量': max_cons
-        })
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return jsonify([])
 
 # ============================================================
-# 仪表盘模板（带盘后兜底数据）
+# 仪表盘模板（集成决策引擎）
 # ============================================================
 HTML_DASHBOARD = r"""
 <!DOCTYPE html>
@@ -373,14 +262,166 @@ HTML_DASHBOARD = r"""
         .leader-badge { font-size:11px; padding:1px 5px; border-radius:3px; margin-left:4px; color:#fff; }
         .badge-strong { background:#e67e22; } .badge-resistant { background:#3498db; } .badge-volume { background:#9b59b6; }
         .extra-label { color:#888; font-size:12px; }
-        .extra-value { font-weight:bold; font-size:13px; }
         .section-line { border-top:1px dashed #ddd; margin:8px 0 4px; padding-top:4px; }
+        .signal-box { background: #f8f9fa; border-radius: 6px; padding: 6px 8px; margin-top: 6px; font-size:13px; }
+        .signal-action { font-weight: bold; }
+        .risk-strong { color: #e74c3c; }
+        .risk-weak { color: #2ecc71; }
+        .risk-neutral { color: #666; }
     </style>
 </head>
 <body>
     <h2>🔍 半导体龙头联动监控</h2>
     <div class="grid" id="stockGrid"></div>
 
+    <!-- 决策引擎（你提供的完整代码） -->
+    <script>
+        const BIG_ORDER_THRESHOLD = {
+            "688981": 300, "002371": 100, "603501": 80,
+            "688041": 150, "688256": 80, "603986": 80,
+            default: 100,
+        };
+        function getBigOrderThreshold(code) {
+            return BIG_ORDER_THRESHOLD[code] || BIG_ORDER_THRESHOLD.default;
+        }
+        function safeNumber(value, fallback = 0) {
+            const n = Number(value);
+            return Number.isFinite(n) ? n : fallback;
+        }
+        function getRecentItems(arr, count) {
+            if (!Array.isArray(arr)) return [];
+            return arr.slice(Math.max(0, arr.length - count));
+        }
+        function analyzePricePosition(snapshot) {
+            const current = safeNumber(snapshot.currentPrice);
+            const avg = safeNumber(snapshot.avgPrice);
+            const open = safeNumber(snapshot.openPrice);
+            const prevClose = safeNumber(snapshot.previousClose);
+            const aboveAvg = current > avg;
+            const aboveOpen = current > open;
+            const abovePrevClose = current > prevClose;
+            let level = "中性";
+            if (aboveAvg && aboveOpen && abovePrevClose) level = "强势";
+            else if (aboveAvg && !abovePrevClose) level = "修复中";
+            else if (!aboveAvg && current < open) level = "偏弱";
+            return { aboveAvg, aboveOpen, abovePrevClose, level,
+                text: `当前价${current}，均价${avg}，${aboveAvg ? "站上均价" : "低于均价"}，状态：${level}`,
+            };
+        }
+        function analyzeMinuteTrend(snapshot) {
+            const recent = getRecentItems(snapshot.minuteData, 10);
+            if (recent.length < 3) return { trend: "数据不足", text: "分时数据不足，暂不判断趋势。" };
+            const first = recent[0].price;
+            const last = recent[recent.length - 1].price;
+            const avgFirst = recent[0].avgPrice;
+            const avgLast = recent[recent.length - 1].avgPrice;
+            let aboveAvgCount = 0;
+            for (const p of recent) { if (p.price >= p.avgPrice) aboveAvgCount += 1; }
+            const priceChange = last - first;
+            const avgChange = avgLast - avgFirst;
+            const aboveAvgRatio = aboveAvgCount / recent.length;
+            let trend = "横盘震荡";
+            if (priceChange > 0 && avgChange >= 0 && aboveAvgRatio >= 0.7) trend = "缓慢抬升";
+            else if (priceChange < 0 && aboveAvgRatio <= 0.4) trend = "震荡下压";
+            else if (aboveAvgRatio >= 0.7) trend = "均价线上方横盘";
+            else if (aboveAvgRatio <= 0.3) trend = "均价线下方弱震荡";
+            return { trend, priceChange, avgChange, aboveAvgRatio,
+                text: `近10分钟分时：${trend}，价格变化${priceChange.toFixed(2)}，均价变化${avgChange.toFixed(2)}。`,
+            };
+        }
+        function analyzeActiveBuySell(snapshot) {
+            const recentTicks = getRecentItems(snapshot.ticks, 80);
+            const threshold = getBigOrderThreshold(snapshot.code);
+            let buyVolume = 0, sellVolume = 0, neutralVolume = 0;
+            let bigBuyCount = 0, bigSellCount = 0;
+            let maxConsecutiveBigBuy = 0, maxConsecutiveBigSell = 0;
+            let currentBigBuyStreak = 0, currentBigSellStreak = 0;
+            for (const tick of recentTicks) {
+                const volume = safeNumber(tick.volume);
+                if (tick.side === "B") {
+                    buyVolume += volume;
+                    if (volume >= threshold) { bigBuyCount += 1; currentBigBuyStreak += 1; currentBigSellStreak = 0; }
+                    else { currentBigBuyStreak = 0; }
+                } else if (tick.side === "S") {
+                    sellVolume += volume;
+                    if (volume >= threshold) { bigSellCount += 1; currentBigSellStreak += 1; currentBigBuyStreak = 0; }
+                    else { currentBigSellStreak = 0; }
+                } else {
+                    neutralVolume += volume; currentBigBuyStreak = 0; currentBigSellStreak = 0;
+                }
+                maxConsecutiveBigBuy = Math.max(maxConsecutiveBigBuy, currentBigBuyStreak);
+                maxConsecutiveBigSell = Math.max(maxConsecutiveBigSell, currentBigSellStreak);
+            }
+            const total = buyVolume + sellVolume + neutralVolume;
+            const buyRatio = total > 0 ? buyVolume / total : 0;
+            const sellRatio = total > 0 ? sellVolume / total : 0;
+            let strength = "买卖均衡";
+            if (buyRatio >= 0.58 && bigBuyCount > bigSellCount) strength = "主动买增强";
+            if (sellRatio >= 0.58 && bigSellCount > bigBuyCount) strength = "主动卖增强";
+            if (maxConsecutiveBigBuy >= 3) strength = "连续大单主动买";
+            if (maxConsecutiveBigSell >= 3) strength = "连续大单主动卖";
+            return { buyVolume, sellVolume, neutralVolume, buyRatio, sellRatio,
+                bigBuyCount, bigSellCount, maxConsecutiveBigBuy, maxConsecutiveBigSell,
+                strength, threshold,
+                text: `近80笔：主动买${buyVolume}手，主动卖${sellVolume}手，大单阈值${threshold}手；状态：${strength}。`,
+            };
+        }
+        function analyzeVolume(snapshot) {
+            const recent = getRecentItems(snapshot.minuteData, 10);
+            if (recent.length < 6) return { status: "数据不足", text: "分钟成交量数据不足。" };
+            const firstHalf = recent.slice(0, 5);
+            const secondHalf = recent.slice(5);
+            const avg1 = firstHalf.reduce((sum, p) => sum + safeNumber(p.volume), 0) / firstHalf.length;
+            const avg2 = secondHalf.reduce((sum, p) => sum + safeNumber(p.volume), 0) / secondHalf.length;
+            const ratio = avg1 > 0 ? avg2 / avg1 : 1;
+            let status = "量能平稳";
+            if (ratio >= 1.6) status = "明显放量";
+            else if (ratio >= 1.25) status = "温和放量";
+            else if (ratio <= 0.7) status = "缩量";
+            return { avgPrevious: avg1, avgRecent: avg2, ratio, status,
+                text: `近10分钟量能：${status}，后5分钟/前5分钟量比 ${ratio.toFixed(2)}。`,
+            };
+        }
+        function generateSignal(snapshot) {
+            const price = analyzePricePosition(snapshot);
+            const trend = analyzeMinuteTrend(snapshot);
+            const active = analyzeActiveBuySell(snapshot);
+            const volume = analyzeVolume(snapshot);
+            let score = 0;
+            if (price.aboveAvg) score += 1;
+            if (price.aboveOpen) score += 1;
+            if (trend.trend === "缓慢抬升") score += 2;
+            if (trend.trend === "均价线上方横盘") score += 1;
+            if (active.strength === "主动买增强") score += 2;
+            if (active.strength === "连续大单主动买") score += 3;
+            if (volume.status === "温和放量") score += 1;
+            if (volume.status === "明显放量") score += 2;
+            if (trend.trend === "震荡下压") score -= 2;
+            if (trend.trend === "均价线下方弱震荡") score -= 1;
+            if (active.strength === "主动卖增强") score -= 2;
+            if (active.strength === "连续大单主动卖") score -= 3;
+            let action = "观察", risk = "中性";
+            if (score >= 6) { action = "可考虑试仓/持仓"; risk = "偏强"; }
+            else if (score >= 3) { action = "继续持有观察"; risk = "中性偏强"; }
+            else if (score <= -3) { action = "风险升高，避免加仓"; risk = "偏弱"; }
+            else { action = "按兵不动"; risk = "中性"; }
+            return { score, action, risk, price, trend, active, volume };
+        }
+        function analyzeStockSnapshot(snapshot) {
+            const signal = generateSignal(snapshot);
+            const brief = `${snapshot.name}（${snapshot.code}）
+当前价：${snapshot.currentPrice} 均价：${snapshot.avgPrice}
+分时：${signal.trend.text}
+主动买：${signal.active.buyVolume}手，${signal.active.strength.includes("买") ? "买盘增强" : "买盘一般"}
+主动卖：${signal.active.sellVolume}手，${signal.active.strength.includes("卖") ? "卖压增强" : "卖压不强"}
+放量：${signal.volume.text}
+大单：阈值${signal.active.threshold}手，大买单${signal.active.bigBuyCount}次，大卖单${signal.active.bigSellCount}次
+操作提示：${signal.action}（评分${signal.score}，风险${signal.risk}）`;
+            return { snapshot, signal, brief };
+        }
+    </script>
+
+    <!-- 仪表盘主逻辑 -->
     <script>
         const CODES = ['sh688981','sz002371','sh603501','sh688041','sh688256','sh603986'];
         async function loadDashboard() {
@@ -416,12 +457,9 @@ HTML_DASHBOARD = r"""
                 card.innerHTML = `
                     <h3>${s.name || s.code} ${badge}</h3>
                     <div class="metrics">
-                        <span>最新</span>
-                        <span class="${chgClass}">${s.price.toFixed(2)}</span>
-                        <span>涨幅</span>
-                        <span class="${chgClass}">${chgPercent}%</span>
-                        <span>量比</span>
-                        <span>${(s.volume_ratio||0).toFixed(2)}</span>
+                        <span>最新</span><span class="${chgClass}">${s.price.toFixed(2)}</span>
+                        <span>涨幅</span><span class="${chgClass}">${chgPercent}%</span>
+                        <span>量比</span><span>${(s.volume_ratio||0).toFixed(2)}</span>
                     </div>
                     <div id="chart_${s.code}" class="sparkline"></div>
                     <div class="section-line"></div>
@@ -434,10 +472,14 @@ HTML_DASHBOARD = r"""
                         <div class="metrics"><span class="extra-label">⑥是否放量:</span><span>--</span></div>
                         <div class="metrics"><span class="extra-label">⑦大单情况:</span><span>--</span></div>
                     </div>
+                    <div id="signal_${s.code}" class="signal-box" style="margin-top:6px;">
+                        加载决策建议中...
+                    </div>
                 `;
                 grid.appendChild(card);
                 loadSparkline(s.code, 'chart_'+s.code);
                 loadExtraInfo(s.code, 'extra_'+s.code);
+                loadDecisionSignal(s.code, 'signal_'+s.code);
             }
         }
 
@@ -465,8 +507,6 @@ HTML_DASHBOARD = r"""
             const container = document.getElementById(containerId);
             if (!container) return;
             const rows = container.querySelectorAll('.metrics');
-
-            // ①当前价
             try {
                 const qResp = await fetch('/api/batch_quote?codes='+code);
                 const qData = await qResp.json();
@@ -474,31 +514,21 @@ HTML_DASHBOARD = r"""
                     rows[0].querySelectorAll('span')[1].innerText = qData[code].price.toFixed(2);
                 }
             } catch(e) {}
-
-            // ②均价（支持盘后兜底）
             try {
                 const avgResp = await fetch('/api/avg_price?code='+code);
                 const avgData = await avgResp.json();
                 if (avgData.success && avgData.avg_price) {
                     rows[1].querySelectorAll('span')[1].innerText = avgData.avg_price.toFixed(2);
-                } else {
-                    rows[1].querySelectorAll('span')[1].innerText = '--';
-                }
+                } else { rows[1].querySelectorAll('span')[1].innerText = '--'; }
             } catch(e) { rows[1].querySelectorAll('span')[1].innerText = '--'; }
-
-            // ③分时
             try {
                 const mResp = await fetch('/api/minute_kline/'+code);
                 const mData = await mResp.json();
                 if (mData.success && mData.data.length > 0) {
                     const latest = mData.data[mData.data.length - 1];
                     rows[2].querySelectorAll('span')[1].innerText = latest.close.toFixed(2);
-                } else {
-                    rows[2].querySelectorAll('span')[1].innerText = '--';
-                }
+                } else { rows[2].querySelectorAll('span')[1].innerText = '--'; }
             } catch(e) { rows[2].querySelectorAll('span')[1].innerText = '--'; }
-
-            // ④⑤主动买/主动卖（支持盘后估算）
             try {
                 const tickResp = await fetch('/api/adv_stats_brief?code='+code);
                 const tickData = await tickResp.json();
@@ -513,8 +543,6 @@ HTML_DASHBOARD = r"""
                 rows[3].querySelectorAll('span')[1].innerText = '--';
                 rows[4].querySelectorAll('span')[1].innerText = '--';
             }
-
-            // ⑥是否放量
             try {
                 const q2Resp = await fetch('/api/batch_quote?codes='+code);
                 const q2Data = await q2Resp.json();
@@ -525,22 +553,78 @@ HTML_DASHBOARD = r"""
                     rows[5].querySelectorAll('span')[1].style.color = isBurst ? '#e74c3c' : '#888';
                 }
             } catch(e) { rows[5].querySelectorAll('span')[1].innerText = '--'; }
-
-            // ⑦大单情况（支持盘后历史均值）
             try {
                 const bigResp = await fetch('/api/big_order_ratio?code='+code);
                 const bigData = await bigResp.json();
                 if (bigData.big_ratio !== undefined) {
                     rows[6].querySelectorAll('span')[1].innerText = bigData.big_ratio + '%';
-                    if (bigData.big_ratio >= 20) {
-                        rows[6].querySelectorAll('span')[1].style.color = '#e74c3c';
-                    } else {
-                        rows[6].querySelectorAll('span')[1].style.color = '#333';
-                    }
-                } else {
-                    rows[6].querySelectorAll('span')[1].innerText = '--';
-                }
+                    rows[6].querySelectorAll('span')[1].style.color = bigData.big_ratio >= 20 ? '#e74c3c' : '#333';
+                } else { rows[6].querySelectorAll('span')[1].innerText = '--'; }
             } catch(e) { rows[6].querySelectorAll('span')[1].innerText = '--'; }
+        }
+
+        async function loadDecisionSignal(code, containerId) {
+            const container = document.getElementById(containerId);
+            if (!container) return;
+            try {
+                // 收集所需数据
+                const [quoteResp, avgResp, minuteResp, tickResp] = await Promise.all([
+                    fetch('/api/batch_quote?codes='+code),
+                    fetch('/api/avg_price?code='+code),
+                    fetch('/api/minute_kline/'+code),
+                    fetch('/api/recent_ticks/'+code)
+                ]);
+                const qData = (await quoteResp.json())[code] || {};
+                const avgData = await avgResp.json();
+                const minuteData = await minuteResp.json();
+                const ticks = await tickResp.json();
+
+                if (!qData.price) {
+                    container.innerHTML = '⚠️ 实时数据缺失，无法生成决策';
+                    return;
+                }
+
+                // 构造 StockSnapshot
+                const snapshot = {
+                    code: code.replace('sh','').replace('sz',''),
+                    name: qData.name || code,
+                    currentPrice: qData.price,
+                    avgPrice: avgData.success ? avgData.avg_price : qData.price,
+                    changePercent: qData.last_close ? ((qData.price - qData.last_close) / qData.last_close * 100) : 0,
+                    openPrice: 0,
+                    previousClose: qData.last_close || 0,
+                    highPrice: 0,
+                    lowPrice: 0,
+                    minuteData: (minuteData.success && minuteData.data) ? minuteData.data.map(p => ({
+                        time: p.time,
+                        price: p.close,
+                        avgPrice: avgData.avg_price || p.close,
+                        volume: p.volume
+                    })) : [],
+                    ticks: ticks.map(t => ({
+                        time: t.time,
+                        price: t.price,
+                        volume: t.volume,
+                        side: t.side
+                    }))
+                };
+
+                const result = analyzeStockSnapshot(snapshot);
+                const s = result.signal;
+                const actionColor = s.risk === '偏强' || s.risk === '中性偏强' ? '#e74c3c' : (s.risk === '偏弱' ? '#2ecc71' : '#666');
+                container.innerHTML = `
+                    <div><span class="extra-label">📊 决策引擎：</span></div>
+                    <div class="metrics"><span>评分</span><span style="font-weight:bold;">${s.score}</span></div>
+                    <div class="metrics"><span>操作提示</span><span class="signal-action" style="color:${actionColor}">${s.action}</span></div>
+                    <div class="metrics"><span>风险</span><span class="risk-${s.risk.includes('强') ? 'strong' : (s.risk.includes('弱') ? 'weak' : 'neutral')}">${s.risk}</span></div>
+                    <div class="metrics"><span>分时趋势</span><span>${s.trend.trend}</span></div>
+                    <div class="metrics"><span>主动买卖</span><span>${s.active.strength}</span></div>
+                    <div class="metrics"><span>放量情况</span><span>${s.volume.status}</span></div>
+                `;
+            } catch (e) {
+                container.innerHTML = '⚠️ 决策数据暂时无法获取（可能非交易时间）';
+                console.error(e);
+            }
         }
 
         window.onload = loadDashboard;
@@ -660,6 +744,119 @@ HTML_STOCK_DETAIL = r"""
 </body>
 </html>
 """
+
+# ---------- 单股盘口 ----------
+@app.route('/api/quote/<code>')
+def quote_detail(code):
+    secid = code_to_eastmoney_secid(code)
+    try:
+        url = "https://push2.eastmoney.com/api/qt/stock/get"
+        fields = ('f43,f44,f45,f46,f47,f48,f50,f57,f58,f60,f169,f170,'
+                  'f19,f20,f21,f22,f23,f24,f25,f26,f27,f28,f29,f30,f31,f32,f33,f34,f35,f36,f37')
+        params = {'secid': secid, 'fields': fields, 'invt': '2', 'fltt': '2'}
+        h = {'Referer': 'https://quote.eastmoney.com/'}
+        r = requests.get(url, params=params, headers=h, timeout=5)
+        d = r.json().get('data', {})
+        if not d:
+            return jsonify({"error": "no data"}), 404
+        def p(field): return d.get(field, 0) / 100 if d.get(field) else 0
+        def vol(field): return int(d.get(field, 0) or 0)
+        buy5 = [
+            {"price": p('f19'), "volume": vol('f20')},
+            {"price": p('f21'), "volume": vol('f22')},
+            {"price": p('f23'), "volume": vol('f24')},
+            {"price": p('f25'), "volume": vol('f26')},
+            {"price": p('f27'), "volume": vol('f28')},
+        ]
+        sell5 = [
+            {"price": p('f29'), "volume": vol('f30')},
+            {"price": p('f31'), "volume": vol('f32')},
+            {"price": p('f33'), "volume": vol('f34')},
+            {"price": p('f35'), "volume": vol('f36')},
+            {"price": p('f37'), "volume": vol('f38')},
+        ]
+        return jsonify({
+            "name": d.get('f58', ''),
+            "price": p('f43'),
+            "last_close": p('f60'),
+            "volume": d.get('f47', 0),
+            "amount": d.get('f48', 0),
+            "volume_ratio": d.get('f50', 0) / 100 if d.get('f50') else 0,
+            "buy5": buy5,
+            "sell5": sell5
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# ---------- 分时成交明细 ----------
+@app.route('/api/tick_data/<code>')
+def tick_data(code):
+    symbol = normalize_symbol(code)
+    try:
+        df = ak.stock_zh_a_tick_tx_js(symbol=symbol)
+        if df is None or df.empty:
+            return jsonify({"error": "no data"}), 404
+        records = []
+        prev_dir = None
+        cnt = 0
+        for _, row in df.iterrows():
+            t = str(row.get('成交时间', ''))
+            price = float(row.get('成交价格', 0))
+            vol = int(row.get('成交量', 0))
+            nature = row.get('性质', '')
+            direction = 'B' if '买' in str(nature) else 'S'
+            is_big = vol >= 500
+            if direction == prev_dir:
+                cnt += 1
+            else:
+                cnt = 1
+                prev_dir = direction
+            consecutive = cnt >= 3
+            records.append({
+                '时间': t,
+                '价格': price,
+                '成交': vol,
+                '方向': direction,
+                '超大单': is_big,
+                '连续': consecutive
+            })
+        return jsonify(records)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# ---------- 资金强度 ----------
+@app.route('/api/adv_stats/<code>')
+def adv_stats(code):
+    symbol = normalize_symbol(code)
+    try:
+        df = ak.stock_zh_a_tick_tx_js(symbol=symbol)
+        if df is None or df.empty:
+            return jsonify({"error": "no data"}), 404
+        df['性质'] = df['性质'].astype(str)
+        df['方向'] = df['性质'].apply(lambda x: 'B' if '买' in x else 'S')
+        df['成交量'] = pd.to_numeric(df['成交量'], errors='coerce').fillna(0)
+        df['时间'] = pd.to_datetime(df['成交时间'], format='%H:%M:%S')
+        now = df['时间'].max()
+        five_min_ago = now - pd.Timedelta(minutes=5)
+        recent = df[(df['时间'] >= five_min_ago) & (df['时间'] <= now)]
+        net5 = int(recent[recent['方向'] == 'B']['成交量'].sum() - recent[recent['方向'] == 'S']['成交量'].sum())
+        buy_vol = df[df['方向'] == 'B']['成交量'].sum()
+        sell_vol = df[df['方向'] == 'S']['成交量'].sum()
+        ratio = round(buy_vol / sell_vol, 2) if sell_vol != 0 else 0
+        big_vol = df[df['成交量'] >= 500]['成交量'].sum()
+        total_vol = df['成交量'].sum()
+        big_ratio = round(big_vol / total_vol * 100, 1) if total_vol > 0 else 0
+        df['连续组'] = (df['方向'] != df['方向'].shift()).cumsum()
+        groups = df[df['方向'] == 'B'].groupby('连续组').agg({'成交量': 'sum'})
+        max_cons = int(groups['成交量'].max()) if not groups.empty else 0
+        return jsonify({
+            '5分钟净流入': net5,
+            '主动买/卖比': ratio,
+            '大单占比': big_ratio,
+            '连续买单最大量': max_cons
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 # ---------- 路由 ----------
 @app.route("/dashboard")
