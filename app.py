@@ -4,6 +4,7 @@ import time
 import statistics
 import concurrent.futures
 import os
+from datetime import datetime, timedelta
 
 app = Flask(__name__)
 
@@ -21,7 +22,7 @@ CACHE_SECONDS = 10
 
 session = requests.Session()
 session.headers.update({
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     "Referer": "https://quote.eastmoney.com/",
     "Accept": "application/json, text/plain, */*"
 })
@@ -45,13 +46,13 @@ def fetch_quote_eastmoney(secid):
     try:
         r = session.get(url, params=params, timeout=(5, 10))
         data = r.json().get("data") or {}
-    except Exception:
+    except:
         return None
 
     pre_close = safe_float(data.get("f60"), 100)
     price = safe_float(data.get("f43"), 100)
     if price is None:
-        price = pre_close  # 非交易时段显示昨收
+        price = pre_close
 
     return {
         "price": price,
@@ -84,8 +85,6 @@ def fetch_quote_sina(code):
         fields = data_str.split(",")
         if len(fields) < 10:
             return None
-        # 字段索引：0-名称, 1-今开, 2-昨收, 3-当前价, 4-最高, 5-最低
-        name = fields[0]
         open_price = safe_float(fields[1])
         pre_close = safe_float(fields[2])
         price = safe_float(fields[3]) or pre_close
@@ -106,20 +105,19 @@ def fetch_quote_sina(code):
             "outer": None,
             "inner": None,
         }
-    except Exception:
+    except:
         return None
 
 def get_quote(stock):
-    """融合行情：东方财富优先，失败则用新浪"""
+    """融合行情：东方财富优先，失败用新浪"""
     quote = fetch_quote_eastmoney(stock["secid"])
     if quote and quote.get("price") is not None:
         return quote
-    # 东方财富失败，尝试新浪
     sina_quote = fetch_quote_sina(stock["sina"])
     return sina_quote if sina_quote else {}
 
-def fetch_trend(secid):
-    """东方财富分时数据（带重试）"""
+def fetch_trend_for_date(secid, date_str):
+    """获取指定日期的分时数据"""
     url = "https://push2his.eastmoney.com/api/qt/stock/trends2/get"
     params = {
         "secid": secid,
@@ -128,12 +126,13 @@ def fetch_trend(secid):
         "iscr": "0",
         "iscca": "0",
         "ndays": "1",
+        "end": date_str,            # 关键：指定日期
         "_": int(time.time() * 1000),
     }
     try:
         r = session.get(url, params=params, timeout=(5, 10))
         trends = (r.json().get("data") or {}).get("trends") or []
-    except Exception:
+    except:
         return []
 
     rows = []
@@ -148,13 +147,24 @@ def fetch_trend(secid):
             })
     return rows
 
+def fetch_trend_with_fallback(secid):
+    """自动回溯最近交易日，返回 (趋势数据, 实际日期)"""
+    # 从今天开始往前找，最多10天
+    today = datetime.now()
+    for i in range(10):
+        date = today - timedelta(days=i)
+        date_str = date.strftime("%Y%m%d")
+        trend = fetch_trend_for_date(secid, date_str)
+        if trend:
+            return trend, date_str
+    return [], today.strftime("%Y%m%d")  # 实在找不到就用今天空数据
+
 def analyze(quote, trend):
     price = quote.get("price")
     pct = quote.get("pct")
     avg = trend[-1]["avg"] if trend and trend[-1].get("avg") else None
 
     prices = [x["price"] for x in trend if x.get("price") is not None]
-
     score = 0
     reasons = []
 
@@ -219,7 +229,7 @@ def analyze(quote, trend):
 def fetch_one_stock(s):
     try:
         quote = get_quote(s)
-        trend = fetch_trend(s["secid"])
+        trend, data_date = fetch_trend_with_fallback(s["secid"])
         decision = analyze(quote, trend)
         return {
             "name": s["name"],
@@ -227,6 +237,7 @@ def fetch_one_stock(s):
             "quote": quote,
             "trend": trend,
             "decision": decision,
+            "data_date": data_date,    # 实际数据日期
             "error": "",
         }
     except Exception as e:
@@ -235,12 +246,8 @@ def fetch_one_stock(s):
             "code": s["code"],
             "quote": {},
             "trend": [],
-            "decision": {
-                "score": 0,
-                "action": "数据暂时异常",
-                "risk": "未知",
-                "reasons": ["接口超时或数据源无响应"],
-            },
+            "decision": {"score": 0, "action": "数据暂时异常", "risk": "未知", "reasons": ["接口超时或数据源无响应"]},
+            "data_date": datetime.now().strftime("%Y%m%d"),
             "error": str(e),
         }
 
@@ -250,13 +257,11 @@ def build_data():
 
     strong = sum(1 for x in result if x["decision"]["score"] >= 5)
     weak = sum(1 for x in result if x["decision"]["score"] <= -2)
-    above_avg = sum(
-        1 for x in result
-        if x["quote"].get("price")
-        and x["trend"]
-        and x["trend"][-1].get("avg")
-        and x["quote"]["price"] > x["trend"][-1]["avg"]
-    )
+    above_avg = sum(1 for x in result
+                    if x["quote"].get("price")
+                    and x["trend"]
+                    and x["trend"][-1].get("avg")
+                    and x["quote"]["price"] > x["trend"][-1]["avg"])
 
     if strong >= 3 and above_avg >= 3:
         sector_status = "板块有修复，可以重点观察"
@@ -265,8 +270,12 @@ def build_data():
     else:
         sector_status = "板块震荡，等待确认"
 
+    # 统一使用第一只股票的数据日期作为整体板块日期
+    common_date = result[0]["data_date"] if result else datetime.now().strftime("%Y%m%d")
+
     return {
         "time": time.strftime("%H:%M:%S"),
+        "data_date": common_date,
         "sector": {
             "status": sector_status,
             "strong": strong,
@@ -316,21 +325,18 @@ body{font-family:Arial,"Microsoft YaHei";background:#f3f4f6;margin:0;color:#1118
 </style>
 </head>
 <body>
-
 <div class="header">
   <h1>板块状态：<span id="sector">加载中...</span></h1>
   <p>刷新时间：<span id="time">--</span></p>
+  <p>数据日期：<span id="dataDate">--</span></p>
   <p>强势股数量：<span id="strong">--</span></p>
   <p>弱势股数量：<span id="weak">--</span></p>
   <p>站上均线数量：<span id="above">--</span></p>
   <p class="err" id="err"></p>
 </div>
-
 <div class="grid" id="grid"></div>
-
 <script>
 let charts = [];
-
 function renderChart(id, trend){
   const dom = document.getElementById(id);
   if(!dom) return;
@@ -359,8 +365,10 @@ async function loadData(){
     const res = await fetch('/api/data?t=' + Date.now());
     if(!res.ok) throw new Error('HTTP ' + res.status);
     const data = await res.json();
+
     document.getElementById('sector').innerText = data.sector.status;
     document.getElementById('time').innerText = data.time;
+    document.getElementById('dataDate').innerText = data.data_date || '--';
     document.getElementById('strong').innerText = data.sector.strong;
     document.getElementById('weak').innerText = data.sector.weak;
     document.getElementById('above').innerText = data.sector.above_avg;
