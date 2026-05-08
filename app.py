@@ -1,15 +1,11 @@
-import os
-import requests
 from flask import Flask, jsonify, render_template_string
-from datetime import datetime
+import requests
+import time
+import statistics
 
 app = Flask(__name__)
 
-# =========================================================
-# 股票列表
-# =========================================================
-
-stocks = [
+STOCKS = [
     {"name": "中芯国际", "code": "688981", "secid": "1.688981"},
     {"name": "兆易创新", "code": "603986", "secid": "1.603986"},
     {"name": "寒武纪", "code": "688256", "secid": "1.688256"},
@@ -18,701 +14,306 @@ stocks = [
     {"name": "豪威集团", "code": "603501", "secid": "1.603501"},
 ]
 
-# =========================================================
-# HTML
-# =========================================================
 
-HTML = r"""
+def safe_float(x, div=1):
+    try:
+        if x is None or x == "-":
+            return None
+        return round(float(x) / div, 2)
+    except Exception:
+        return None
+
+
+def fetch_quote(secid):
+    url = "https://push2.eastmoney.com/api/qt/stock/get"
+    params = {
+        "secid": secid,
+        "fields": "f43,f44,f45,f46,f47,f48,f60,f170,f171,f168,f169,f170,f116,f117,f49,f161",
+        "_": int(time.time() * 1000),
+    }
+    r = requests.get(url, params=params, timeout=6)
+    data = r.json().get("data") or {}
+
+    return {
+        "price": safe_float(data.get("f43"), 100),
+        "high": safe_float(data.get("f44"), 100),
+        "low": safe_float(data.get("f45"), 100),
+        "open": safe_float(data.get("f46"), 100),
+        "volume": safe_float(data.get("f47"), 100),
+        "amount": safe_float(data.get("f48"), 100000000),
+        "pre_close": safe_float(data.get("f60"), 100),
+        "pct": safe_float(data.get("f170"), 100),
+        "turnover": safe_float(data.get("f168"), 100),
+        "market_cap": safe_float(data.get("f116"), 100000000),
+        "float_cap": safe_float(data.get("f117"), 100000000),
+        "outer": safe_float(data.get("f49"), 1),
+        "inner": safe_float(data.get("f161"), 1),
+    }
+
+
+def fetch_trend(secid):
+    url = "https://push2his.eastmoney.com/api/qt/stock/trends2/get"
+    params = {
+        "secid": secid,
+        "fields1": "f1,f2,f3,f4,f5,f6,f7,f8",
+        "fields2": "f51,f52,f53,f54,f55,f56,f57,f58",
+        "iscr": "0",
+        "iscca": "0",
+        "ndays": "1",
+        "_": int(time.time() * 1000),
+    }
+    r = requests.get(url, params=params, timeout=6)
+    trends = (r.json().get("data") or {}).get("trends") or []
+
+    rows = []
+    for item in trends:
+        p = item.split(",")
+        if len(p) >= 8:
+            rows.append({
+                "time": p[0][-5:],
+                "price": safe_float(p[1]),
+                "avg": safe_float(p[2]),
+                "volume": safe_float(p[5]),
+                "amount": safe_float(p[6]),
+            })
+    return rows
+
+
+def analyze(stock, quote, trend):
+    price = quote.get("price")
+    pct = quote.get("pct")
+    avg = trend[-1]["avg"] if trend else None
+
+    prices = [x["price"] for x in trend if x.get("price")]
+    score = 0
+    reasons = []
+
+    if price and avg:
+        if price > avg:
+            score += 2
+            reasons.append("站上均线")
+        else:
+            score -= 2
+            reasons.append("低于均线")
+
+    if pct is not None:
+        if pct > 1:
+            score += 2
+            reasons.append("涨幅较强")
+        elif pct < -3:
+            score -= 3
+            reasons.append("跌幅偏大")
+        elif pct < -1:
+            score -= 1
+            reasons.append("弱势震荡")
+
+    if len(prices) >= 20:
+        recent = prices[-10:]
+        earlier = prices[-30:-20] if len(prices) >= 30 else prices[:10]
+        if statistics.mean(recent) > statistics.mean(earlier):
+            score += 2
+            reasons.append("短线回升")
+        else:
+            score -= 2
+            reasons.append("短线走弱")
+
+    outer = quote.get("outer") or 0
+    inner = quote.get("inner") or 0
+    if outer > inner * 1.2 and outer > 0:
+        score += 2
+        reasons.append("主动买强")
+    elif inner > outer * 1.2 and inner > 0:
+        score -= 2
+        reasons.append("主动卖强")
+
+    if score >= 5:
+        action = "可小仓试探"
+        risk = "中"
+    elif score >= 2:
+        action = "只观察，不追高"
+        risk = "中"
+    elif score <= -4:
+        action = "不买，继续等"
+        risk = "偏高"
+    else:
+        action = "观望"
+        risk = "中性"
+
+    return {
+        "score": score,
+        "action": action,
+        "risk": risk,
+        "reasons": reasons,
+    }
+
+
+@app.route("/api/data")
+def api_data():
+    result = []
+    for s in STOCKS:
+        try:
+            quote = fetch_quote(s["secid"])
+            trend = fetch_trend(s["secid"])
+            decision = analyze(s, quote, trend)
+            result.append({
+                **s,
+                "quote": quote,
+                "trend": trend,
+                "decision": decision,
+            })
+        except Exception as e:
+            result.append({
+                **s,
+                "error": str(e),
+                "quote": {},
+                "trend": [],
+                "decision": {"score": 0, "action": "数据异常", "risk": "未知", "reasons": []},
+            })
+
+    strong = sum(1 for x in result if x["decision"]["score"] >= 5)
+    weak = sum(1 for x in result if x["decision"]["score"] <= -2)
+    above_avg = sum(
+        1 for x in result
+        if x["quote"].get("price") and x["trend"] and x["quote"].get("price") > x["trend"][-1].get("avg", 999999)
+    )
+
+    if strong >= 3 and above_avg >= 3:
+        sector = "板块有修复，可以重点观察"
+    elif weak >= 4:
+        sector = "板块整体偏弱"
+    else:
+        sector = "板块震荡，等待确认"
+
+    return jsonify({
+        "time": time.strftime("%H:%M:%S"),
+        "sector": {
+            "status": sector,
+            "strong": strong,
+            "weak": weak,
+            "above_avg": above_avg,
+        },
+        "stocks": result,
+    })
+
+
+HTML = """
 <!DOCTYPE html>
 <html lang="zh">
 <head>
 <meta charset="UTF-8">
-<title>半导体六股联动监控台</title>
-
+<title>股票联动监控</title>
 <script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
-
 <style>
-
-body{
-    margin:0;
-    background:#f3f4f6;
-    font-family:Arial,"Microsoft YaHei";
-}
-
-header{
-    background:#111827;
-    color:white;
-    padding:14px 20px;
-}
-
-header h1{
-    margin:0;
-    font-size:22px;
-}
-
-#time{
-    margin-top:5px;
-    font-size:13px;
-    color:#cbd5e1;
-}
-
-#sector{
-    margin:12px;
-    padding:14px;
-    background:white;
-    border-radius:12px;
-    box-shadow:0 2px 8px rgba(0,0,0,.08);
-    line-height:1.9;
-}
-
-.grid{
-    display:grid;
-    grid-template-columns:repeat(3,1fr);
-    gap:12px;
-    padding:12px;
-}
-
-.card{
-    background:white;
-    border-radius:12px;
-    padding:12px;
-    box-shadow:0 2px 8px rgba(0,0,0,.08);
-}
-
-.name{
-    font-size:20px;
-    font-weight:bold;
-}
-
-.code{
-    color:#6b7280;
-    font-size:13px;
-}
-
-.price{
-    font-size:32px;
-    font-weight:bold;
-    margin-top:6px;
-}
-
-.chart{
-    width:100%;
-    height:180px;
-    margin-top:10px;
-}
-
-.info{
-    margin-top:8px;
-    line-height:1.9;
-    font-size:13px;
-}
-
-.decision{
-    margin-top:10px;
-    background:#f9fafb;
-    border-radius:10px;
-    padding:10px;
-    line-height:1.8;
-    font-size:13px;
-}
-
-.red{
-    color:#dc2626;
-}
-
-.green{
-    color:#16a34a;
-}
-
-.orange{
-    color:#ea580c;
-}
-
-.gray{
-    color:#6b7280;
-}
-
-footer{
-    padding:14px;
-    font-size:13px;
-    color:#6b7280;
-}
-
-@media(max-width:1000px){
-    .grid{
-        grid-template-columns:repeat(2,1fr);
-    }
-}
-
-@media(max-width:650px){
-    .grid{
-        grid-template-columns:1fr;
-    }
-}
-
+body{font-family:Arial,"Microsoft YaHei";background:#f3f4f6;margin:0;color:#111827}
+.header{background:white;padding:18px 22px;margin-bottom:18px;box-shadow:0 2px 10px #ddd}
+.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;padding:0 14px 30px}
+.card{background:white;border-radius:12px;padding:16px;box-shadow:0 2px 10px #ddd}
+.name{font-size:22px;font-weight:700}
+.code{color:#6b7280;font-size:13px}
+.price{font-size:30px;font-weight:800;margin-top:8px}
+.red{color:#dc2626}.green{color:#059669}.gray{color:#6b7280}
+.chart{height:180px;margin:12px 0}
+.info{line-height:1.75;font-size:14px}
+.decision{background:#f9fafb;border-radius:10px;padding:12px;margin-top:12px;line-height:1.8}
+.big{font-size:26px;font-weight:800}
+.tag{display:inline-block;padding:3px 8px;border-radius:8px;background:#e5e7eb;margin-right:6px}
+.buy{background:#dcfce7;color:#166534}
+.wait{background:#fef9c3;color:#854d0e}
+.no{background:#fee2e2;color:#991b1b}
+@media(max-width:1000px){.grid{grid-template-columns:1fr}}
 </style>
 </head>
 <body>
 
-<header>
-    <h1>半导体六股联动监控台</h1>
-    <div id="time">加载中...</div>
-</header>
-
-<div id="sector">加载中...</div>
+<div class="header">
+  <h1>板块状态：<span id="sector">加载中...</span></h1>
+  <p>刷新时间：<span id="time">--</span></p>
+  <p>强势股数量：<span id="strong">--</span></p>
+  <p>弱势股数量：<span id="weak">--</span></p>
+  <p>站上均线数量：<span id="above">--</span></p>
+</div>
 
 <div class="grid" id="grid"></div>
 
-<footer>
-自动刷新：30秒一次。  
-评分高于5分才考虑重点观察。  
-低于0分原则上不参与。
-</footer>
-
 <script>
-
-const stocks = {{ stocks|safe }};
-
-let charts = {};
-
-function formatMoney(v){
-
-    if(v === undefined || v === null) return "--";
-
-    const abs = Math.abs(v);
-
-    if(abs >= 100000000){
-        return (v / 100000000).toFixed(2) + "亿";
-    }
-
-    if(abs >= 10000){
-        return (v / 10000).toFixed(2) + "万";
-    }
-
-    return v.toFixed(0);
-}
-
-function getColor(v){
-
-    if(v > 0) return "#dc2626";
-
-    if(v < 0) return "#16a34a";
-
-    return "#333";
-}
-
-async function getJson(url){
-
-    const r = await fetch(url + "&_=" + Date.now(), {
-        cache:"no-store"
-    });
-
-    return await r.json();
-}
-
-async function fetchBase(stock){
-
-    const url =
-    `https://push2.eastmoney.com/api/qt/stock/get?secid=${stock.secid}&fields=f43,f44,f45,f46,f47,f48,f57,f58,f60,f170`;
-
-    const j = await getJson(url);
-
-    const d = j.data || {};
-
-    return {
-
-        ...stock,
-
-        price: d.f43 ? d.f43 / 100 : 0,
-
-        high: d.f44 ? d.f44 / 100 : 0,
-
-        low: d.f45 ? d.f45 / 100 : 0,
-
-        open: d.f46 ? d.f46 / 100 : 0,
-
-        amount: d.f48 || 0,
-
-        yesterday: d.f60 ? d.f60 / 100 : 0,
-
-        changePercent: d.f170 ? d.f170 / 100 : 0
-    };
-}
-
-async function fetchMinute(stock){
-
-    const url =
-    `https://push2his.eastmoney.com/api/qt/stock/trends2/get?secid=${stock.secid}&fields1=f1,f2,f3,f4,f5,f6,f7,f8&fields2=f51,f52,f53,f54,f55,f56,f57,f58`;
-
-    const j = await getJson(url);
-
-    const arr = j.data?.trends || [];
-
-    return arr.map(x=>{
-
-        const a = x.split(",");
-
-        return {
-
-            time:a[0]?.slice(11,16),
-
-            price:Number(a[2]),
-
-            avg:Number(a[7]),
-
-            volume:Number(a[5]),
-
-            amount:Number(a[6])
-
-        };
-
-    }).filter(x=>x.price > 0);
-}
-
-async function fetchDetails(stock){
-
-    const url =
-    `https://push2.eastmoney.com/api/qt/stock/details/get?secid=${stock.secid}&fields1=f1,f2,f3,f4&fields2=f51,f52,f53,f54,f55`;
-
-    const j = await getJson(url);
-
-    const details = j.data?.details || [];
-
-    if(!Array.isArray(details)){
-
-        return {
-
-            activeBuy:0,
-            activeSell:0,
-            buySellDiff:0,
-
-            bigBuy:0,
-            bigSell:0,
-            bigOrderDiff:0
-        };
-    }
-
-    let activeBuy = 0;
-    let activeSell = 0;
-
-    let bigBuy = 0;
-    let bigSell = 0;
-
-    details.forEach(item=>{
-
-        const a = item.split(",");
-
-        if(a.length < 5) return;
-
-        const price = Number(a[1]);
-
-        const volume = Number(a[2]);
-
-        const direction = String(a[4]).trim();
-
-        const money = price * volume * 100;
-
-        if(!price || !volume || money <= 0) return;
-
-        // 主动买
-
-        if(direction === "2"){
-
-            activeBuy += money;
-
-            if(money >= 500000){
-
-                bigBuy += money;
-            }
-        }
-
-        // 主动卖
-
-        else if(direction === "1"){
-
-            activeSell += money;
-
-            if(money >= 500000){
-
-                bigSell += money;
-            }
-        }
-
-    });
-
-    return {
-
-        activeBuy,
-        activeSell,
-
-        buySellDiff: activeBuy - activeSell,
-
-        bigBuy,
-        bigSell,
-
-        bigOrderDiff: bigBuy - bigSell
-    };
-}
-
-function analyze(stock, minute){
-
-    let score = 0;
-
-    let trend = "震荡观察";
-
-    let action = "继续等待";
-
-    let risk = "中性";
-
-    const latest = minute[minute.length - 1];
-
-    const avg = latest?.avg || 0;
-
-    if(stock.changePercent > 1) score += 2;
-
-    if(stock.changePercent > 3) score += 2;
-
-    if(stock.changePercent < -2) score -= 2;
-
-    if(stock.changePercent < -4) score -= 2;
-
-    if(stock.price > avg && avg > 0) score += 2;
-
-    if(stock.price < avg && avg > 0) score -= 2;
-
-    if(stock.buySellDiff > 0) score += 2;
-
-    if(stock.buySellDiff < 0) score -= 2;
-
-    if(stock.bigOrderDiff > 0) score += 2;
-
-    if(stock.bigOrderDiff < 0) score -= 2;
-
-    if(score >= 5){
-
-        trend = "强势";
-
-        action = "重点观察";
-
-        risk = "偏低";
-    }
-
-    else if(score >= 2){
-
-        trend = "转强观察";
-
-        action = "等待确认";
-
-        risk = "中性";
-    }
-
-    else if(score <= -4){
-
-        trend = "弱势回避";
-
-        action = "不买，继续等";
-
-        risk = "偏高";
-    }
-
-    return {
-
-        score,
-        trend,
-        action,
-        risk,
-        avg
-    };
-}
-
-function drawChart(code,data){
-
-    const el = document.getElementById("chart-" + code);
-
-    if(!el) return;
-
-    if(charts[code]){
-
-        charts[code].dispose();
-    }
-
-    const chart = echarts.init(el);
-
-    charts[code] = chart;
+async function loadData(){
+  const res = await fetch('/api/data?t=' + Date.now());
+  const data = await res.json();
+
+  document.getElementById('sector').innerText = data.sector.status;
+  document.getElementById('time').innerText = data.time;
+  document.getElementById('strong').innerText = data.sector.strong;
+  document.getElementById('weak').innerText = data.sector.weak;
+  document.getElementById('above').innerText = data.sector.above_avg;
+
+  const grid = document.getElementById('grid');
+  grid.innerHTML = '';
+
+  data.stocks.forEach((s, i) => {
+    const q = s.quote || {};
+    const d = s.decision || {};
+    const pct = q.pct ?? 0;
+    const colorClass = pct >= 0 ? 'red' : 'green';
+
+    let tagClass = 'wait';
+    if(d.score >= 5) tagClass = 'buy';
+    if(d.score <= -4) tagClass = 'no';
+
+    const div = document.createElement('div');
+    div.className = 'card';
+    div.innerHTML = `
+      <div class="name">${s.name}</div>
+      <div class="code">${s.code}</div>
+      <div class="price ${colorClass}">${q.price ?? '--'}</div>
+      <div class="${colorClass}">涨幅：${q.pct ?? '--'}%</div>
+      <div id="chart${i}" class="chart"></div>
+
+      <div class="info">
+        今开：${q.open ?? '--'}　最高：${q.high ?? '--'}　最低：${q.low ?? '--'}<br>
+        昨收：${q.pre_close ?? '--'}　成交额：${q.amount ?? '--'}亿<br>
+        换手：${q.turnover ?? '--'}%　流通市值：${q.float_cap ?? '--'}亿
+      </div>
+
+      <div class="decision">
+        <div>评分：<span class="big">${d.score}</span></div>
+        <div>操作提示：<span class="tag ${tagClass}">${d.action}</span></div>
+        <div>风险：${d.risk}</div>
+        <div>判断依据：${(d.reasons || []).join(' / ')}</div>
+      </div>
+    `;
+    grid.appendChild(div);
+
+    const chart = echarts.init(document.getElementById('chart'+i));
+    const times = (s.trend || []).map(x => x.time);
+    const prices = (s.trend || []).map(x => x.price);
+    const avgs = (s.trend || []).map(x => x.avg);
 
     chart.setOption({
-
-        animation:false,
-
-        grid:{
-            left:8,
-            right:8,
-            top:10,
-            bottom:10
-        },
-
-        tooltip:{
-            trigger:"axis"
-        },
-
-        xAxis:{
-            type:"category",
-            show:false,
-            data:data.map(x=>x.time)
-        },
-
-        yAxis:{
-            type:"value",
-            show:false,
-            scale:true
-        },
-
-        series:[
-
-            {
-                type:"line",
-                smooth:true,
-                showSymbol:false,
-                data:data.map(x=>x.price),
-                lineStyle:{
-                    width:1.5
-                },
-                areaStyle:{
-                    opacity:0.12
-                }
-            },
-
-            {
-                type:"line",
-                smooth:true,
-                showSymbol:false,
-                data:data.map(x=>x.avg),
-                lineStyle:{
-                    width:1,
-                    type:"dashed"
-                }
-            }
-
-        ]
+      animation:false,
+      grid:{left:35,right:10,top:10,bottom:25},
+      xAxis:{type:'category',data:times,axisLabel:{show:false}},
+      yAxis:{type:'value',scale:true,axisLabel:{fontSize:10}},
+      series:[
+        {name:'价格',type:'line',data:prices,smooth:true,symbol:'none',lineStyle:{width:2}},
+        {name:'均价',type:'line',data:avgs,smooth:true,symbol:'none',lineStyle:{width:1,type:'dashed'}}
+      ],
+      tooltip:{trigger:'axis'}
     });
+  });
 }
 
-function sectorInfo(arr){
-
-    const strong = arr.filter(x=>x.score >= 5).length;
-
-    const weak = arr.filter(x=>x.score <= -4).length;
-
-    const above = arr.filter(x=>x.price > x.avg).length;
-
-    const active = arr.filter(x=>x.buySellDiff > 0).length;
-
-    let signal = "板块震荡观察";
-
-    if(strong >= 3){
-
-        signal = "板块转强";
-    }
-
-    if(weak >= 4){
-
-        signal = "板块整体偏弱";
-    }
-
-    return {
-
-        signal,
-        strong,
-        weak,
-        above,
-        active
-    };
-}
-
-function card(stock){
-
-    const color = getColor(stock.changePercent);
-
-    return `
-
-    <div class="card">
-
-        <div class="name">${stock.name}</div>
-
-        <div class="code">${stock.code}</div>
-
-        <div class="price" style="color:${color}">
-            ${stock.price.toFixed(2)}
-        </div>
-
-        <div style="color:${color}">
-            涨幅：${stock.changePercent.toFixed(2)}%
-        </div>
-
-        <div class="chart" id="chart-${stock.code}"></div>
-
-        <div class="info">
-
-            <div>今开：${stock.open.toFixed(2)}</div>
-
-            <div>最高：${stock.high.toFixed(2)}</div>
-
-            <div>最低：${stock.low.toFixed(2)}</div>
-
-            <div>昨收：${stock.yesterday.toFixed(2)}</div>
-
-            <div>成交额：${formatMoney(stock.amount)}</div>
-
-            <div>均价：${stock.avg.toFixed(2)}</div>
-
-        </div>
-
-        <div class="decision">
-
-            <div>评分：${stock.score}</div>
-
-            <div>
-            操作提示：
-            <span style="font-weight:bold;color:${color}">
-            ${stock.action}
-            </span>
-            </div>
-
-            <div>风险：${stock.risk}</div>
-
-            <div>分时趋势：${stock.trend}</div>
-
-            <div style="color:${getColor(stock.buySellDiff)}">
-            主动买卖差：${formatMoney(stock.buySellDiff)}
-            </div>
-
-            <div style="color:${getColor(stock.bigOrderDiff)}">
-            大单净额：${formatMoney(stock.bigOrderDiff)}
-            </div>
-
-            <div>
-            主动买：${formatMoney(stock.activeBuy)}
-            /
-            主动卖：${formatMoney(stock.activeSell)}
-            </div>
-
-            <div>
-            大单买：${formatMoney(stock.bigBuy)}
-            /
-            大单卖：${formatMoney(stock.bigSell)}
-            </div>
-
-        </div>
-
-    </div>
-    `;
-}
-
-async function load(){
-
-    const grid = document.getElementById("grid");
-
-    const baseList =
-    await Promise.all(stocks.map(fetchBase));
-
-    const minuteList =
-    await Promise.all(stocks.map(fetchMinute));
-
-    const detailList =
-    await Promise.all(stocks.map(fetchDetails));
-
-    const result = stocks.map((s,i)=>{
-
-        const merged = {
-
-            ...baseList[i],
-
-            ...detailList[i]
-        };
-
-        const analysis =
-        analyze(merged,minuteList[i]);
-
-        return {
-
-            ...merged,
-
-            ...analysis,
-
-            minute:minuteList[i]
-        };
-    });
-
-    const sector = sectorInfo(result);
-
-    document.getElementById("sector").innerHTML = `
-
-        <h2 style="margin:0 0 8px">
-        板块状态：${sector.signal}
-        </h2>
-
-        <div>强势股数量：${sector.strong}</div>
-
-        <div>弱势股数量：${sector.weak}</div>
-
-        <div>站上均线数量：${sector.above}</div>
-
-        <div>主动买入占优数量：${sector.active}</div>
-    `;
-
-    grid.innerHTML =
-    result.map(card).join("");
-
-    requestAnimationFrame(()=>{
-
-        result.forEach(x=>{
-
-            drawChart(x.code,x.minute);
-        });
-    });
-
-    document.getElementById("time").innerText =
-    "最后刷新：" + new Date().toLocaleTimeString();
-}
-
-window.addEventListener("resize",()=>{
-
-    Object.values(charts).forEach(c=>{
-
-        c.resize();
-    });
-});
-
-load();
-
-setInterval(load,30000);
-
+loadData();
+setInterval(loadData, 15000);
 </script>
 
 </body>
 </html>
 """
 
-# =========================================================
-# ROUTE
-# =========================================================
-
 @app.route("/")
 def index():
-    return render_template_string(
-        HTML,
-        stocks=stocks
-    )
+    return render_template_string(HTML)
 
-# =========================================================
-# RUN
-# =========================================================
 
 if __name__ == "__main__":
-
-    port = int(os.environ.get("PORT", 5000))
-
-    app.run(
-        host="0.0.0.0",
-        port=port
-    )
+    app.run(host="0.0.0.0", port=5000)
